@@ -1,0 +1,35 @@
+{
+    "name": "TransmutPyspark Dev Environment",
+    "build": {
+        "context": "..",
+        "dockerfile": "../dockerfile"
+    },
+
+    // 1. Instala extensões essenciais automaticamente ao abrir o container
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylint",
+                "njpwerner.autodocstring" // Ajuda na documentação do TCC
+            ],
+            "settings": {
+                // Aponta para o Python da Bitnami
+                "python.defaultInterpreterPath": "/opt/bitnami/python/bin/python3",
+                "python.analysis.extraPaths": ["/app"]
+            }
+        }
+    },
+
+    // 2. IMPORTANTE: Conecta como o usuário da Bitnami (non-root)
+    // Isso evita erros de permissão ao criar arquivos no VS Code
+    "remoteUser": "1001",
+    "updateRemoteUserUID": true,
+    "containerUser": "1001",
+
+    // 3. Abre as portas do Spark UI (se você quiser ver o grafo de execução)
+    "forwardPorts": [4040],
+
+    // 4. Garante que as dependências do requirements.txt estão atualizadas
+    "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt"
+}
