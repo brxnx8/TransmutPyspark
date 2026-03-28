@@ -21,7 +21,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, PropertyMock, patch
 
-from config_loader import ConfigLoader
+from src.config_loader.code.config_loader import ConfigLoader
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
