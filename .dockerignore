@@ -1,0 +1,20 @@
+# Git
+.git
+.gitignore
+
+# Python cache e ambientes virtuais
+__pycache__/
+*.py[cod]
+*$py.class
+.venv
+venv/
+ENV/
+
+# VS Code e IDEs
+.vscode/
+.devcontainer/
+
+
+# Documentação pesada
+*.md
+LICENSE
