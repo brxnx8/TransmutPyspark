@@ -3,88 +3,39 @@ MutationManager
 ===============
 Responsible for:
   1. Parsing the PySpark program source (obtained from ConfigLoader) into an AST.
-  2. Receiving Operator objects and applying their mutations to the AST,
-     generating one mutant per occurrence found in the tree.
+  2. Coordinating with Operator objects to identify eligible nodes and obtain
+     replacement nodes, then reconstructing the mutated source code.
   3. Storing every generated mutant (as source code) in ``mutateList``.
 
 Deliberately out of scope:
-  - File I/O of source programs   → ConfigLoader
-  - Deciding *what* to mutate     → Operator
-  - Running tests against mutants → TestRunner (future)
+  - File I/O of source programs        → ConfigLoader
+  - Deciding *what* nodes are eligible → Operator.analyseAST()
+  - Deciding *how* to replace a node   → Operator.buildMutate()
+  - Running tests against mutants      → TestRunner (future)
+
+Flow
+----
+::
+
+    cfg     = ConfigLoader(...).load()
+    manager = MutationManager(configLoader=cfg)
+    manager.parseToAST(cfg.program_source)   # 1. parse → internal AST
+
+    operator.set_code_ast(manager.program_ast)
+    operator.analyseAST()                    # 2. operator finds eligible nodes
+
+    manager.applyMutation(operator)          # 3. manager generates mutants
+                                             #    using operator.buildMutate()
 """
 
 import ast
 import copy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING
 
-# Forward reference only — avoids a hard circular import when Operator is
-# defined in a separate module.  At runtime we use the Protocol below.
 if TYPE_CHECKING:
-    from config_loader import ConfigLoader
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# Operator Protocol                                                            #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-@runtime_checkable
-class OperatorProtocol(Protocol):
-    """
-    Structural interface that every Operator must satisfy.
-
-    Attributes
-    ----------
-    target_node_type : type[ast.AST]
-        The AST node class this operator targets (e.g. ``ast.Add``).
-    replacement_node : ast.AST
-        A *template* node that will replace each matched target node.
-        MutationManager deep-copies it before each substitution so the
-        original template is never mutated.
-    operator_id : str
-        Human-readable identifier used in log messages and mutant metadata
-        (e.g. ``"AOR"``, ``"ROR"``).
-    """
-
-    target_node_type: type
-    replacement_node: ast.AST
-    operator_id: str
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# Internal helper — NodeReplacer                                               #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-class _NodeReplacer(ast.NodeTransformer):
-    """
-    AST NodeTransformer that replaces **one specific occurrence** of a target
-    node type with a replacement node, leaving all other occurrences intact.
-
-    Parameters
-    ----------
-    target_type      : type[ast.AST]  — node class to match.
-    replacement_node : ast.AST        — node to insert (deep-copied internally).
-    occurrence_index : int            — zero-based index of the occurrence to replace.
-    """
-
-    def __init__(
-        self,
-        target_type: type,
-        replacement_node: ast.AST,
-        occurrence_index: int,
-    ) -> None:
-        self._target_type = target_type
-        self._replacement_node = replacement_node
-        self._occurrence_index = occurrence_index
-        self._current_count = 0
-
-    def generic_visit(self, node: ast.AST) -> ast.AST:
-        if isinstance(node, self._target_type):
-            if self._current_count == self._occurrence_index:
-                self._current_count += 1
-                return copy.deepcopy(self._replacement_node)
-            self._current_count += 1
-        return super().generic_visit(node)
+    from code.config_loader import ConfigLoader
+    from code.operator import Operator
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -98,22 +49,53 @@ class Mutant:
 
     Attributes
     ----------
-    operator_id      : Identifier of the operator that produced this mutant.
-    occurrence_index : Zero-based index of the occurrence that was replaced.
-    source_code      : The full mutated program as a source-code string.
+    operator_name    : Name of the operator that produced this mutant
+                       (e.g. ``"AOR"``).
+    occurrence_index : Zero-based index of the occurrence that was replaced
+                       within the operator's ``registers`` list.
+    source_code      : The full mutated program as a source-code string,
+                       ready to be written to disk or executed.
     """
 
-    operator_id: str
+    operator_name: str
     occurrence_index: int
     source_code: str
 
     def __repr__(self) -> str:
         preview = self.source_code[:60].replace("\n", "\\n")
         return (
-            f"Mutant(operator={self.operator_id!r}, "
+            f"Mutant(operator={self.operator_name!r}, "
             f"occurrence={self.occurrence_index}, "
             f"source_preview={preview!r}...)"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Internal helper — NodeReplacer                                               #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+class _NodeReplacer(ast.NodeTransformer):
+    """
+    Replaces **one specific node instance** in the AST with a replacement node.
+
+    Unlike a type-based replacer, this one matches by object identity so it
+    works correctly even when the same node type appears multiple times —
+    the Operator already identified exactly which instance to replace.
+
+    Parameters
+    ----------
+    target_node      : The exact node instance to replace (identity match).
+    replacement_node : The node to insert in its place (deep-copied on use).
+    """
+
+    def __init__(self, target_node: ast.AST, replacement_node: ast.AST) -> None:
+        self._target_node = target_node
+        self._replacement_node = replacement_node
+
+    def generic_visit(self, node: ast.AST) -> ast.AST:
+        if node is self._target_node:
+            return copy.deepcopy(self._replacement_node)
+        return super().generic_visit(node)
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -128,25 +110,11 @@ class MutationManager:
     Parameters
     ----------
     configLoader : ConfigLoader
-        A fully loaded ConfigLoader instance that provides the program
-        source code and workspace metadata.
+        A fully loaded ``ConfigLoader`` instance that provides the raw
+        program source and workspace metadata.
     mutateList : list[Mutant]
         Accumulator for every mutant generated across all operators.
-        Starts empty and is populated by successive ``applyMutation`` calls.
-
-    Typical usage
-    -------------
-    ::
-
-        cfg     = ConfigLoader(...).load()
-        manager = MutationManager(configLoader=cfg)
-        tree    = manager.parseToAST(cfg.program_source)
-
-        for operator in operators:
-            manager.applyMutation(operator)
-
-        for mutant in manager.mutateList:
-            print(mutant)
+        Starts empty and grows with each ``applyMutation`` call.
     """
 
     configLoader: "ConfigLoader"
@@ -172,19 +140,22 @@ class MutationManager:
         """
         Parse a PySpark program source string into an AST.
 
-        The resulting tree is stored internally and used by subsequent
-        ``applyMutation`` calls. Calling ``parseToAST`` again replaces the
-        current tree and clears ``mutateList`` to avoid stale mutants.
+        The resulting tree is stored internally and exposed via
+        ``program_ast`` so that Operator instances can receive it through
+        ``operator.set_code_ast(manager.program_ast)``.
+
+        Calling ``parseToAST`` again with new source replaces the current
+        tree and clears ``mutateList`` to avoid stale mutants.
 
         Parameters
         ----------
         source : str
-            Raw Python/PySpark source code to parse.
+            Raw Python / PySpark source code to parse.
 
         Returns
         -------
         ast.AST
-            The parsed syntax tree.
+            The parsed and location-fixed syntax tree.
 
         Raises
         ------
@@ -199,20 +170,17 @@ class MutationManager:
             tree = ast.parse(source)
         except SyntaxError as exc:
             raise ValueError(
-                f"[MutationManager] Syntax error in source at line {exc.lineno}: {exc.msg}"
+                f"[MutationManager] Syntax error in source at line "
+                f"{exc.lineno}: {exc.msg}"
             ) from exc
 
-        # Fix missing line numbers so ast.unparse works correctly
         ast.fix_missing_locations(tree)
 
         self._program_source = source
         self._program_ast = tree
 
-        # Reset mutants — new source means previous mutants are stale
         if self.mutateList:
-            print(
-                "[MutationManager] New source provided — clearing previous mutants."
-            )
+            print("[MutationManager] New source — clearing previous mutants.")
             self.mutateList.clear()
 
         print(
@@ -221,58 +189,83 @@ class MutationManager:
         )
         return self._program_ast
 
-    def applyMutation(self, operator: OperatorProtocol) -> list[Mutant]:
+    def applyMutation(self, operator: "Operator") -> list[Mutant]:
         """
-        Apply a single mutation operator to the parsed AST.
+        Generate one mutant per node registered by ``operator.analyseAST()``.
 
-        For each occurrence of ``operator.target_node_type`` found in the
-        tree, one independent mutant is generated (all other occurrences
-        remain untouched in that mutant).  Every generated ``Mutant`` is
-        appended to ``self.mutateList``.
+        For each node in ``operator.registers``:
+          1. Calls ``operator.buildMutate(node)`` to obtain the replacement.
+          2. Deep-copies the original AST.
+          3. Substitutes that exact node instance with the replacement.
+          4. Unparses the mutated tree back to source code.
+          5. Wraps the result in a ``Mutant`` and appends it to
+             ``self.mutateList``.
+
+        The original ``_program_ast`` is never modified.
 
         Parameters
         ----------
-        operator : OperatorProtocol
-            An object exposing ``target_node_type``, ``replacement_node``
-            and ``operator_id``.
+        operator : Operator
+            A concrete ``Operator`` subclass that has already had
+            ``analyseAST()`` called, so that ``operator.registers`` is
+            populated with the eligible nodes.
 
         Returns
         -------
         list[Mutant]
-            The subset of mutants generated by *this* operator call
-            (also available in ``self.mutateList``).
+            The mutants generated by this call (also stored in
+            ``self.mutateList``).
 
         Raises
         ------
         RuntimeError
             If ``parseToAST`` has not been called yet.
         TypeError
-            If ``operator`` does not satisfy ``OperatorProtocol``.
+            If ``operator`` does not expose the required interface
+            (``name``, ``registers``, ``analyseAST``, ``buildMutate``).
+        ValueError
+            If ``operator.registers`` is empty (``analyseAST`` was not
+            called or found no eligible nodes).
         """
         self._assert_ast_ready()
         self._validate_operator(operator)
 
-        # Count how many occurrences of the target node exist in the tree
-        occurrences = self._count_occurrences(operator.target_node_type)
-
-        if occurrences == 0:
+        if not operator.registers:
             print(
-                f"[MutationManager] Operator '{operator.operator_id}': "
-                f"no occurrences of {operator.target_node_type.__name__} found — "
-                f"skipping."
+                f"[MutationManager] Operator '{operator.name}': "
+                f"registers is empty — call analyseAST() first or no "
+                f"eligible nodes exist in the current AST."
             )
             return []
 
         new_mutants: list[Mutant] = []
 
-        for idx in range(occurrences):
-            # Work on a deep copy of the original tree for every mutant
+        for idx, target_node in enumerate(operator.registers):
+            # Ask the operator how to replace this specific node
+            replacement_node = operator.buildMutate(target_node)
+
+            # Work on a deep copy so the original tree is never mutated
             tree_copy = copy.deepcopy(self._program_ast)
 
+            # After deep copy, the identity of target_node is gone — find
+            # the equivalent node in the copy by position/index
+            original_nodes = list(ast.walk(self._program_ast))
+            copied_nodes = list(ast.walk(tree_copy))
+
+            try:
+                node_index = original_nodes.index(target_node)
+                target_in_copy = copied_nodes[node_index]
+            except (ValueError, IndexError):
+                print(
+                    f"[MutationManager] Operator '{operator.name}': "
+                    f"could not locate node at occurrence {idx} in the "
+                    f"copied tree — skipping."
+                )
+                continue
+
             replacer = _NodeReplacer(
-                target_type=operator.target_node_type,
-                replacement_node=operator.replacement_node,
-                occurrence_index=idx,
+                target_node=target_in_copy,
+                replacement_node=replacement_node,
             )
             mutated_tree = replacer.visit(tree_copy)
             ast.fix_missing_locations(mutated_tree)
@@ -280,7 +273,7 @@ class MutationManager:
             mutant_source = ast.unparse(mutated_tree)
 
             mutant = Mutant(
-                operator_id=operator.operator_id,
+                operator_name=operator.name,
                 occurrence_index=idx,
                 source_code=mutant_source,
             )
@@ -288,10 +281,9 @@ class MutationManager:
             self.mutateList.append(mutant)
 
         print(
-            f"[MutationManager] Operator '{operator.operator_id}': "
-            f"{len(new_mutants)} mutant(s) generated "
-            f"({occurrences} occurrence(s) of "
-            f"{operator.target_node_type.__name__})."
+            f"[MutationManager] Operator '{operator.name}': "
+            f"{len(new_mutants)} mutant(s) generated from "
+            f"{len(operator.registers)} registered node(s)."
         )
         return new_mutants
 
@@ -301,13 +293,13 @@ class MutationManager:
 
     @property
     def program_ast(self) -> ast.AST:
-        """The parsed AST of the program. Available after parseToAST()."""
+        """The parsed AST. Available after ``parseToAST()``."""
         self._assert_ast_ready()
         return self._program_ast
 
     @property
     def program_source(self) -> str:
-        """The raw source that was parsed. Available after parseToAST()."""
+        """The raw source that was parsed. Available after ``parseToAST()``."""
         self._assert_ast_ready()
         return self._program_source
 
@@ -316,35 +308,23 @@ class MutationManager:
     # ------------------------------------------------------------------ #
 
     def _validate_config_loader(self) -> None:
-            """Ensure configLoader is a loaded ConfigLoader instance."""
-            
-            # 1. Checa apenas os atributos que não são propriedades dinâmicas perigosas
-            required_attrs = ("workspace_path", "operatorsList")
-            for attr in required_attrs:
-                if not hasattr(self.configLoader, attr):
-                    raise TypeError(
-                        f"[MutationManager] configLoader must be a loaded ConfigLoader "
-                        f"instance (missing attribute '{attr}')."
-                    )
-
-            # 2. Testa a existência e o estado do program_source no mesmo bloco
-            try:
-                _ = self.configLoader.program_source
-            except AttributeError:
-                # Caso a classe nem tenha o atributo implementado
+        """Duck-type check: configLoader must expose the required attributes."""
+        required_attrs = ("program_source", "workspace_path", "operatorsList")
+        for attr in required_attrs:
+            if not hasattr(self.configLoader, attr):
                 raise TypeError(
-                    "[MutationManager] configLoader must be a loaded ConfigLoader "
-                    "instance (missing attribute 'program_source')."
+                    f"[MutationManager] configLoader is missing attribute "
+                    f"'{attr}'. Pass a loaded ConfigLoader instance."
                 )
-            except RuntimeError as exc:
-                # Caso o atributo exista, mas indique que não foi carregado
-                raise RuntimeError(
-                    f"[MutationManager] The provided ConfigLoader has not been loaded yet. "
-                    f"Call configLoader.load() before passing it to MutationManager."
-                ) from exc
+        try:
+            _ = self.configLoader.program_source
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "[MutationManager] The provided ConfigLoader has not been "
+                "loaded yet. Call configLoader.load() first."
+            ) from exc
 
     def _validate_mutate_list(self) -> None:
-        """Ensure mutateList is a list."""
         if not isinstance(self.mutateList, list):
             raise TypeError(
                 f"[MutationManager] mutateList must be a list, "
@@ -352,7 +332,6 @@ class MutationManager:
             )
 
     def _validate_source(self, source: str) -> None:
-        """Ensure source is a non-empty string."""
         if not isinstance(source, str) or not source.strip():
             raise TypeError(
                 f"[MutationManager] source must be a non-empty string, "
@@ -360,44 +339,30 @@ class MutationManager:
             )
 
     def _validate_operator(self, operator: object) -> None:
-        """Ensure operator satisfies OperatorProtocol."""
-        if not isinstance(operator, OperatorProtocol):
+        """Duck-type check: operator must expose name, registers, and methods."""
+        required_attrs = ("name", "registers", "analyseAST", "buildMutate")
+        for attr in required_attrs:
+            if not hasattr(operator, attr):
+                raise TypeError(
+                    f"[MutationManager] operator is missing attribute / method "
+                    f"'{attr}'. Pass a concrete Operator subclass instance."
+                )
+        if not isinstance(operator.name, str) or not operator.name.strip():
             raise TypeError(
-                f"[MutationManager] operator must satisfy OperatorProtocol "
-                f"(needs 'target_node_type', 'replacement_node', 'operator_id'). "
-                f"Got: {type(operator)}"
+                f"[MutationManager] operator.name must be a non-empty string, "
+                f"got: {operator.name!r}"
             )
-        if not isinstance(operator.target_node_type, type) or not issubclass(
-            operator.target_node_type, ast.AST
-        ):
+        if not isinstance(operator.registers, list):
             raise TypeError(
-                f"[MutationManager] operator.target_node_type must be a subclass "
-                f"of ast.AST, got: {operator.target_node_type!r}"
+                f"[MutationManager] operator.registers must be a list, "
+                f"got: {type(operator.registers)}"
             )
-        if not isinstance(operator.replacement_node, ast.AST):
-            raise TypeError(
-                f"[MutationManager] operator.replacement_node must be an ast.AST "
-                f"instance, got: {type(operator.replacement_node)}"
-            )
-        if not isinstance(operator.operator_id, str) or not operator.operator_id.strip():
-            raise TypeError(
-                f"[MutationManager] operator.operator_id must be a non-empty string, "
-                f"got: {operator.operator_id!r}"
-            )
-
-    def _count_occurrences(self, target_type: type) -> int:
-        """Count how many nodes of target_type exist in the current AST."""
-        return sum(
-            1 for node in ast.walk(self._program_ast)
-            if isinstance(node, target_type)
-        )
 
     def _assert_ast_ready(self) -> None:
-        """Raise if parseToAST() has not been called yet."""
         if self._program_ast is None:
             raise RuntimeError(
                 "[MutationManager] AST is not available. "
-                "Call parseToAST(source) before using this method."
+                "Call parseToAST(source) first."
             )
 
     # ------------------------------------------------------------------ #
@@ -405,10 +370,9 @@ class MutationManager:
     # ------------------------------------------------------------------ #
 
     def __repr__(self) -> str:
-        ast_ready = self._program_ast is not None
         return (
             f"MutationManager("
-            f"ast_ready={ast_ready}, "
+            f"ast_ready={self._program_ast is not None}, "
             f"mutants={len(self.mutateList)}"
             f")"
         )
