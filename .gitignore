@@ -206,5 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# Custom ignores for the execution environment
 etl_project_example/etl_code/mutants
 etl_project_example/etl_code/report.html
