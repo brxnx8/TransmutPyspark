@@ -1,0 +1,3 @@
+program_path = /workspaces/TransmutPyspark/etl_project_example/etl_code/nftp.py
+tests_path   = /workspaces/TransmutPyspark/etl_project_example/etl_test/test_nftp.py
+operators_list = NFTP

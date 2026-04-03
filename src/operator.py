@@ -7,38 +7,43 @@ must implement.
 Design decisions
 ----------------
 - Uses ``ABC`` + ``@abstractmethod`` so that instantiating a subclass that
-  has not implemented ``analyseAST`` or ``buildMutate`` raises a clear
+  has not implemented ``analyse_ast`` or ``build_mutant`` raises a clear
   ``TypeError`` immediately.
-- Attributes (``name``, ``registers``, ``codeAST``) are shared by every
-  concrete operator and are validated in ``__post_init__``.
-- ``analyseAST``  → inspects the AST and records which nodes are eligible
-                    for mutation, storing them in ``registers``.
-- ``buildMutate`` → constructs and returns the replacement AST node for a
-                    given target node.  The caller (MutationManager) is
-                    responsible for applying the node to the full tree.
+- Attributes (``id``, ``name``, ``mutant_registers``, ``mutant_list``) are
+  shared by every concrete operator and validated in ``__post_init__``.
+- ``analyse_ast``  → receives the AST tree directly as a parameter,
+                     analyses it and returns the eligible nodes for mutation.
+- ``build_mutant`` → receives the nodes found by ``analyse_ast``, applies
+                     substitutions on the original tree, generates the mutant
+                     source files, wraps each result in a ``Mutant`` instance,
+                     stores them in ``mutant_list`` and returns the full list.
 
 Relationship with MutationManager
 ----------------------------------
 ::
 
-    manager.parseToAST(source)          # builds the AST
-    operator.codeAST = manager.program_ast
-    operator.analyseAST()               # populates operator.registers
-    for node in operator.registers:
-        replacement = operator.buildMutate(node)
-        # MutationManager uses replacement to generate each mutant
+    manager.parseToAST(source)                         # builds the AST
+    nodes = operator.analyse_ast(manager.program_ast)  # finds eligible nodes
+    mutants = operator.build_mutant(nodes)             # generates mutants
+    # mutants are also stored in operator.mutant_list
 
 Deliberately out of scope
 --------------------------
-- Applying the mutant to the full tree → MutationManager.applyMutation()
-- Running tests against mutants        → TestRunner (future)
+- Parsing source code into AST  → MutationManager.parseToAST()
+- Running tests against mutants → TestRunner
+- Reporting results             → Reporter (future)
 """
 
 import ast
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from .mutant import Mutant
 
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Abstract Operator                                                            #
+# ─────────────────────────────────────────────────────────────────────────── #
 
 @dataclass
 class Operator(ABC):
@@ -47,88 +52,113 @@ class Operator(ABC):
 
     Attributes
     ----------
-    name : str
-        Human-readable identifier for the operator (e.g. ``"AOR"``,
-        ``"ROR"``, ``"LCR"``).  Must be a non-empty string.
-    registers : list[ast.AST]
-        Metadata store populated by ``analyseAST()``.  Each entry is an
-        AST node that this operator is eligible to mutate.  Starts empty
-        and is repopulated every time ``analyseAST()`` is called.
-    codeAST : ast.AST | None
-        The parsed AST of the program under mutation.  Provided by
-        MutationManager after ``parseToAST()`` is called.  Must be set
-        before calling ``analyseAST()``.
+    id               : int
+        Unique numeric identifier for this operator instance.
+    name             : str
+        Human-readable name for the operator (e.g. ``"AOR"``, ``"ROR"``).
+        Normalised to uppercase on construction.
+    mutant_registers : str | list[str]
+        Metadata describing where/how this operator applies — e.g. a node
+        type name (``"Add"``) or a list of them (``["Lt", "Gt", "LtE"]``).
+        Used by concrete subclasses to guide ``analyse_ast``.
+    mutant_list      : list[Mutant]
+        Accumulator populated by ``build_mutant``.  Empty on construction;
+        grows with each call to ``build_mutant``.
     """
 
-    name: str
-    registers: list[ast.AST] = field(default_factory=list)
-    codeAST: ast.AST | None = field(default=None)
+    id:               int
+    name:             str
+    mutant_registers: str | list[str]
+    mutant_list:      list[Mutant] = field(default_factory=list)
 
     # ------------------------------------------------------------------ #
     # Post-init validation                                                 #
     # ------------------------------------------------------------------ #
 
     def __post_init__(self) -> None:
+        self._validate_id()
         self._validate_name()
-        self._validate_registers()
-        self._validate_code_ast()
+        self._validate_mutant_registers()
+        self._validate_mutant_list()
 
     # ------------------------------------------------------------------ #
-    # Abstract interface — subclasses MUST implement these                 #
+    # Abstract interface — subclasses MUST implement both methods          #
     # ------------------------------------------------------------------ #
 
     @abstractmethod
-    def analyseAST(self) -> list[ast.AST]:
+    def analyse_ast(self, tree: ast.AST) -> list[ast.AST]:
         """
-        Inspect ``self.codeAST`` and identify every node that this operator
-        can mutate.
+        Analyse ``tree`` and return every node eligible for mutation.
 
         Implementations must:
-          1. Walk ``self.codeAST`` looking for eligible nodes.
-          2. Store the found nodes in ``self.registers`` (replacing any
-             previous content).
-          3. Return ``self.registers`` for convenience.
+          1. Walk ``tree`` looking for nodes that match this operator's
+             criteria (guided by ``self.mutant_registers``).
+          2. Return the list of matching nodes — these are passed directly
+             to ``build_mutant``.
+
+        Parameters
+        ----------
+        tree : ast.AST
+            The parsed AST of the PySpark program, obtained from
+            ``MutationManager.program_ast``.
 
         Returns
         -------
         list[ast.AST]
-            The nodes eligible for mutation (same object as
-            ``self.registers``).
-
-        Raises
-        ------
-        RuntimeError
-            If ``self.codeAST`` has not been set yet.
-        """
-        ...
-
-    @abstractmethod
-    def buildMutate(self, target_node: ast.AST) -> ast.AST:
-        """
-        Construct and return the replacement node for ``target_node``.
-
-        The returned node is handed to MutationManager, which deep-copies
-        it and splices it into the full AST to produce a mutant.
-
-        Parameters
-        ----------
-        target_node : ast.AST
-            The original AST node to be replaced.  Implementations may
-            inspect it to decide the exact replacement (e.g. for ROR an
-            ``ast.Lt`` becomes ``ast.Gt``).
-
-        Returns
-        -------
-        ast.AST
-            A *new* AST node that will replace ``target_node`` in the
-            mutated program.
+            Nodes eligible for mutation.  Empty list if none found.
 
         Raises
         ------
         TypeError
-            If ``target_node`` is not an ``ast.AST`` instance.
+            If ``tree`` is not an ``ast.AST`` instance.
+        """
+        ...
+
+    @abstractmethod
+    def build_mutant(self,
+                     nodes: list[ast.AST],
+                     original_ast: ast.AST,
+                     original_path: str,
+                     mutant_dir: str) -> list[Mutant]:
+        """
+        Generate one ``Mutant`` per node, write each to disk and populate
+        ``self.mutant_list``.
+
+        For each node in ``nodes``, implementations must:
+          1. Deep-copy ``original_ast``.
+          2. Replace the target node with the appropriate substitute.
+          3. Unparse the modified tree back to source code.
+          4. Write the mutated source to a ``.py`` file inside
+             ``mutant_dir``.
+          5. Record the modified line.
+          6. Create a ``Mutant`` instance and append it to
+             ``self.mutant_list``.
+
+        At the end return ``self.mutant_list``.
+
+        Parameters
+        ----------
+        nodes : list[ast.AST]
+            Eligible nodes returned by ``analyse_ast``.
+        original_ast : ast.AST
+            The unmodified program AST (must not be mutated in place).
+        original_path : str
+            Absolute path to the original PySpark source file — stored in
+            each ``Mutant.original_path``.
+        mutant_dir : str
+            Directory where mutant ``.py`` files will be written.
+
+        Returns
+        -------
+        list[Mutant]
+            The full ``self.mutant_list`` after appending the new mutants.
+
+        Raises
+        ------
+        TypeError
+            If ``nodes`` is not a list or contains non-``ast.AST`` items.
         ValueError
-            If ``target_node`` is not a node type this operator handles.
+            If ``original_path`` or ``mutant_dir`` is not a non-empty string.
         """
         ...
 
@@ -136,101 +166,112 @@ class Operator(ABC):
     # Concrete helpers available to all subclasses                         #
     # ------------------------------------------------------------------ #
 
-    def set_code_ast(self, code_ast: ast.AST) -> None:
+    def clear_mutant_list(self) -> None:
         """
-        Set (or replace) the AST to be analysed.
+        Empty ``mutant_list`` without touching any other attribute.
 
-        Clears ``registers`` automatically so stale data from a previous
-        analysis is never mixed with results from the new tree.
-
-        Parameters
-        ----------
-        code_ast : ast.AST
-            A parsed AST, typically obtained from
-            ``MutationManager.program_ast``.
-
-        Raises
-        ------
-        TypeError
-            If ``code_ast`` is not an ``ast.AST`` instance.
-        """
-        if not isinstance(code_ast, ast.AST):
-            raise TypeError(
-                f"[Operator:{self.name}] codeAST must be an ast.AST instance, "
-                f"got: {type(code_ast)}"
-            )
-        self.codeAST = code_ast
-        self.registers.clear()
-        print(f"[Operator:{self.name}] codeAST updated — registers cleared.")
-
-    def clear_registers(self) -> None:
-        """
-        Empty ``registers`` without replacing ``codeAST``.
-
-        Useful when the same operator instance is reused across multiple
+        Useful when reusing the same operator instance across multiple
         mutation rounds.
         """
-        self.registers.clear()
-        print(f"[Operator:{self.name}] Registers cleared.")
+        self.mutant_list.clear()
+        print(f"[Operator:{self.name}] mutant_list cleared.")
 
     # ------------------------------------------------------------------ #
-    # Protected helpers for use inside subclass implementations            #
+    # Protected guards — call these inside subclass implementations        #
     # ------------------------------------------------------------------ #
 
-    def _assert_code_ast_ready(self) -> None:
-        """
-        Raise ``RuntimeError`` if ``codeAST`` has not been set.
-
-        Subclasses should call this at the top of ``analyseAST()``.
-        """
-        if self.codeAST is None:
-            raise RuntimeError(
-                f"[Operator:{self.name}] codeAST is not set. "
-                f"Call set_code_ast() or assign codeAST before analyseAST()."
+    def _assert_valid_tree(self, tree: ast.AST) -> None:
+        """Raise ``TypeError`` if ``tree`` is not an ``ast.AST`` instance."""
+        if not isinstance(tree, ast.AST):
+            raise TypeError(
+                f"[Operator:{self.name}] tree must be an ast.AST instance, "
+                f"got: {type(tree)}"
             )
 
-    def _assert_node_in_registers(self, node: ast.AST) -> None:
-        """
-        Raise ``ValueError`` if ``node`` was not registered by ``analyseAST()``.
+    def _assert_valid_nodes(self, nodes: list[ast.AST]) -> None:
+        """Raise ``TypeError`` if ``nodes`` is not a list of AST nodes."""
+        if not isinstance(nodes, list):
+            raise TypeError(
+                f"[Operator:{self.name}] nodes must be a list, "
+                f"got: {type(nodes)}"
+            )
+        invalid = [n for n in nodes if not isinstance(n, ast.AST)]
+        if invalid:
+            raise TypeError(
+                f"[Operator:{self.name}] All items in nodes must be "
+                f"ast.AST instances. Invalid entries: {invalid}"
+            )
 
-        Subclasses may call this inside ``buildMutate()`` to guard against
-        nodes that this operator does not handle.
-        """
-        if node not in self.registers:
+    def _assert_valid_path(self, path: str, param_name: str) -> None:
+        """Raise ``ValueError`` if ``path`` is not a non-empty string."""
+        if not isinstance(path, str) or not path.strip():
             raise ValueError(
-                f"[Operator:{self.name}] The provided node is not in registers. "
-                f"Ensure analyseAST() has been called and the node is eligible."
+                f"[Operator:{self.name}] {param_name} must be a non-empty "
+                f"string, got: {path!r}"
             )
+
+    def _next_mutant_id(self) -> int:
+        """Return the next available mutant id (1-based, sequential)."""
+        return len(self.mutant_list) + 1
 
     # ------------------------------------------------------------------ #
     # Private validators                                                   #
     # ------------------------------------------------------------------ #
 
+    def _validate_id(self) -> None:
+        if not isinstance(self.id, int) or self.id < 0:
+            raise TypeError(
+                f"[Operator] id must be a non-negative integer, "
+                f"got: {self.id!r}"
+            )
+
     def _validate_name(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
             raise TypeError(
-                f"[Operator] name must be a non-empty string, got: {self.name!r}"
+                f"[Operator] name must be a non-empty string, "
+                f"got: {self.name!r}"
             )
         self.name = self.name.strip().upper()
 
-    def _validate_registers(self) -> None:
-        if not isinstance(self.registers, list):
+    def _validate_mutant_registers(self) -> None:
+        if isinstance(self.mutant_registers, str):
+            if not self.mutant_registers.strip():
+                raise ValueError(
+                    f"[Operator:{self.name}] mutant_registers must not be "
+                    f"an empty string."
+                )
+        elif isinstance(self.mutant_registers, list):
+            if not self.mutant_registers:
+                raise ValueError(
+                    f"[Operator:{self.name}] mutant_registers list must not "
+                    f"be empty."
+                )
+            invalid = [
+                r for r in self.mutant_registers
+                if not isinstance(r, str) or not r.strip()
+            ]
+            if invalid:
+                raise ValueError(
+                    f"[Operator:{self.name}] All items in mutant_registers "
+                    f"must be non-empty strings. Invalid: {invalid}"
+                )
+        else:
             raise TypeError(
-                f"[Operator:{self.name}] registers must be a list, "
-                f"got: {type(self.registers)}"
-            )
-        invalid = [r for r in self.registers if not isinstance(r, ast.AST)]
-        if invalid:
-            raise TypeError(
-                f"[Operator:{self.name}] All items in registers must be ast.AST "
-                f"instances. Invalid entries: {invalid}"
+                f"[Operator:{self.name}] mutant_registers must be a str or "
+                f"list[str], got: {type(self.mutant_registers)}"
             )
 
-    def _validate_code_ast(self) -> None:
-        if self.codeAST is not None and not isinstance(self.codeAST, ast.AST):
+    def _validate_mutant_list(self) -> None:
+        if not isinstance(self.mutant_list, list):
             raise TypeError(
-                f"[Operator:{self.name}] codeAST must be an ast.AST instance or None, "
-                f"got: {type(self.codeAST)}"
+                f"[Operator:{self.name}] mutant_list must be a list, "
+                f"got: {type(self.mutant_list)}"
+            )
+        invalid = [m for m in self.mutant_list if not isinstance(m, Mutant)]
+        if invalid:
+            raise TypeError(
+                f"[Operator:{self.name}] All items in mutant_list must be "
+                f"Mutant instances. Invalid entries: {invalid}"
             )
 
     # ------------------------------------------------------------------ #
@@ -240,8 +281,9 @@ class Operator(ABC):
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
+            f"id={self.id}, "
             f"name={self.name!r}, "
-            f"registers={len(self.registers)} node(s), "
-            f"codeAST={'set' if self.codeAST is not None else 'not set'}"
+            f"mutant_registers={self.mutant_registers!r}, "
+            f"mutants={len(self.mutant_list)}"
             f")"
         )

@@ -1,368 +1,455 @@
 """
 MutationManager
 ===============
-Responsible for:
-  1. Parsing the PySpark program source (obtained from ConfigLoader) into an AST.
-  2. Coordinating with Operator objects to identify eligible nodes and obtain
-     replacement nodes, then reconstructing the mutated source code.
-  3. Storing every generated mutant (as source code) in ``mutateList``.
+Orchestrator of the full mutation-testing pipeline.
 
-Deliberately out of scope:
-  - File I/O of source programs        → ConfigLoader
-  - Deciding *what* nodes are eligible → Operator.analyseAST()
-  - Deciding *how* to replace a node   → Operator.buildMutate()
-  - Running tests against mutants      → TestRunner (future)
+Responsibilities
+----------------
+1. ``load``             — build ConfigLoader from config file, read program source.
+2. ``parse_to_ast``     — parse source into an AST.
+3. ``apply_mutation``   — resolve each operator identifier to its concrete
+                          Operator subclass, run analyse_ast + build_mutant
+                          and accumulate all generated mutants.
+4. ``run_tests``        — hand the mutant list to TestRunner and collect
+                          TestResult instances.
+5. ``agregate_results`` — hand results to Report for scoring, display and
+                          diff generation.
 
-Flow
-----
-::
+Every method populates its corresponding attribute and returns ``self``,
+allowing full method chaining::
 
-    cfg     = ConfigLoader(...).load()
-    manager = MutationManager(configLoader=cfg)
-    manager.parseToAST(cfg.program_source)   # 1. parse → internal AST
+    MutationManager("config.txt")
+        .load()
+        .parse_to_ast()
+        .apply_mutation()
+        .run_tests()
+        .agregate_results()
 
-    operator.set_code_ast(manager.program_ast)
-    operator.analyseAST()                    # 2. operator finds eligible nodes
+Error policy
+------------
+Failures in individual operators (apply_mutation) or individual mutants
+(run_tests) are caught, logged and skipped — the pipeline always continues
+with the remaining items.
 
-    manager.applyMutation(operator)          # 3. manager generates mutants
-                                             #    using operator.buildMutate()
+Deliberately out of scope
+--------------------------
+- Deciding *what* nodes are eligible    → Operator.analyse_ast()
+- Deciding *how* to replace a node      → Operator.build_mutant()
+- Running the pytest subprocess         → TestRunner
+- Computing scores and rendering output → Report
 """
 
 import ast
-import copy
+import importlib
+import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .config_loader import ConfigLoader
+
 if TYPE_CHECKING:
-    from code.config_loader import ConfigLoader
-    from code.operator import Operator
+    from .operator import Operator
+    from .mutant import Mutant
+    from .test_runner import TestRunner
+    from .test_result import TestResult
+    from .reporter import Reporter
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
-# Mutant dataclass                                                             #
+# Operator registry                                                            #
+#                                                                              #
+# Maps each operator identifier (as it appears in config.operators_list) to   #
+# the dotted import path of its concrete Operator subclass.                   #
+# Add new operators here as they are implemented.                              #
 # ─────────────────────────────────────────────────────────────────────────── #
 
-@dataclass
-class Mutant:
-    """
-    Represents a single generated mutant.
+_OPERATOR_REGISTRY: dict[str, str] = {
+     "NFTP": "src.operator_nftp.OperatorNFTP",
+    # "ROR": "code.operators.ror_operator.ROROperator",
+    # "LCR": "code.operators.lcr_operator.LCROperator",
+}
 
-    Attributes
-    ----------
-    operator_name    : Name of the operator that produced this mutant
-                       (e.g. ``"AOR"``).
-    occurrence_index : Zero-based index of the occurrence that was replaced
-                       within the operator's ``registers`` list.
-    source_code      : The full mutated program as a source-code string,
-                       ready to be written to disk or executed.
-    """
-
-    operator_name: str
-    occurrence_index: int
-    source_code: str
-
-    def __repr__(self) -> str:
-        preview = self.source_code[:60].replace("\n", "\\n")
-        return (
-            f"Mutant(operator={self.operator_name!r}, "
-            f"occurrence={self.occurrence_index}, "
-            f"source_preview={preview!r}...)"
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# Internal helper — NodeReplacer                                               #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-class _NodeReplacer(ast.NodeTransformer):
-    """
-    Replaces **one specific node instance** in the AST with a replacement node.
-
-    Unlike a type-based replacer, this one matches by object identity so it
-    works correctly even when the same node type appears multiple times —
-    the Operator already identified exactly which instance to replace.
-
-    Parameters
-    ----------
-    target_node      : The exact node instance to replace (identity match).
-    replacement_node : The node to insert in its place (deep-copied on use).
-    """
-
-    def __init__(self, target_node: ast.AST, replacement_node: ast.AST) -> None:
-        self._target_node = target_node
-        self._replacement_node = replacement_node
-
-    def generic_visit(self, node: ast.AST) -> ast.AST:
-        if node is self._target_node:
-            return copy.deepcopy(self._replacement_node)
-        return super().generic_visit(node)
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# MutationManager                                                              #
-# ─────────────────────────────────────────────────────────────────────────── #
 
 @dataclass
 class MutationManager:
     """
-    Orchestrates the mutation-testing pipeline for a PySpark program.
+    Orchestrates the full mutation-testing pipeline.
 
     Parameters
     ----------
-    configLoader : ConfigLoader
-        A fully loaded ``ConfigLoader`` instance that provides the raw
-        program source and workspace metadata.
-    mutateList : list[Mutant]
-        Accumulator for every mutant generated across all operators.
-        Starts empty and grows with each ``applyMutation`` call.
+    config_path : str
+        Path to the plain-text configuration file.  ``load()`` reads it,
+        builds the ``ConfigLoader`` instance and populates ``code_original``.
+
+    Attributes
+    ----------
+    config        : ConfigLoader | None
+        Populated by ``load()``.
+    code_original : str
+        Raw source code of the PySpark application.  Populated by ``load()``.
+    code_ast      : ast.AST | None
+        Parsed AST of the original program.  Populated by ``parse_to_ast()``.
+    mutant_list   : list[Mutant]
+        All mutants generated across every operator.  Populated by
+        ``apply_mutation()``.
+    result_list   : list[TestResult]
+        Test outcomes for every mutant.  Populated by ``run_tests()``.
     """
 
-    configLoader: "ConfigLoader"
-    mutateList: list[Mutant] = field(default_factory=list)
-
-    # Internal state — populated by parseToAST()
-    _program_ast: ast.AST = field(init=False, default=None, repr=False)
-    _program_source: str = field(init=False, default="", repr=False)
+    config_path:   str
+    config:        ConfigLoader | None = field(default=None,           init=False)
+    code_original: str                 = field(default="",             init=False)
+    code_ast:      ast.AST | None      = field(default=None,           init=False)
+    mutant_list:   list                = field(default_factory=list,   init=False)
+    result_list:   list                = field(default_factory=list,   init=False)
 
     # ------------------------------------------------------------------ #
     # Post-init validation                                                 #
     # ------------------------------------------------------------------ #
 
     def __post_init__(self) -> None:
-        self._validate_config_loader()
-        self._validate_mutate_list()
+        if not isinstance(self.config_path, str) or not self.config_path.strip():
+            raise ValueError(
+                "[MutationManager] config_path must be a non-empty string."
+            )
 
     # ------------------------------------------------------------------ #
-    # Public API                                                           #
+    # Pipeline steps                                                       #
     # ------------------------------------------------------------------ #
 
-    def parseToAST(self, source: str) -> ast.AST:
+    def load(self) -> "MutationManager":
         """
-        Parse a PySpark program source string into an AST.
+        Build the ``ConfigLoader`` instance and read the program source.
 
-        The resulting tree is stored internally and exposed via
-        ``program_ast`` so that Operator instances can receive it through
-        ``operator.set_code_ast(manager.program_ast)``.
+        Reads ``config_path`` as a plain-text file where each non-blank,
+        non-comment line follows ``key = value``.  Recognised keys:
 
-        Calling ``parseToAST`` again with new source replaces the current
-        tree and clears ``mutateList`` to avoid stale mutants.
-
-        Parameters
-        ----------
-        source : str
-            Raw Python / PySpark source code to parse.
+        - ``program_path``   — path to the PySpark .py file
+        - ``tests_path``     — path to the pytest .py file
+        - ``operators_list`` — comma-separated operator identifiers
 
         Returns
         -------
-        ast.AST
-            The parsed and location-fixed syntax tree.
+        self — for method chaining.
 
         Raises
         ------
-        TypeError
-            If ``source`` is not a non-empty string.
+        FileNotFoundError
+            If ``config_path`` or ``program_path`` do not exist.
         ValueError
-            If ``source`` contains a syntax error.
+            If required config keys are missing or program source is empty.
         """
-        self._validate_source(source)
+        self._validate_config_path()
 
-        try:
-            tree = ast.parse(source)
-        except SyntaxError as exc:
+        raw    = Path(self.config_path).read_text(encoding="utf-8")
+        parsed = self._parse_config_file(raw)
+
+        required = ("program_path", "tests_path", "operators_list")
+        missing  = [k for k in required if k not in parsed]
+        if missing:
             raise ValueError(
-                f"[MutationManager] Syntax error in source at line "
-                f"{exc.lineno}: {exc.msg}"
-            ) from exc
+                f"[MutationManager.load] Missing required config keys: "
+                f"{missing}"
+            )
 
-        ast.fix_missing_locations(tree)
+        operators_list = [
+            op.strip().upper()
+            for op in parsed["operators_list"].split(",")
+            if op.strip()
+        ]
 
-        self._program_source = source
-        self._program_ast = tree
-
-        if self.mutateList:
-            print("[MutationManager] New source — clearing previous mutants.")
-            self.mutateList.clear()
-
-        print(
-            f"[MutationManager] Source parsed successfully "
-            f"({sum(1 for _ in ast.walk(tree))} AST nodes)."
+        self.config = ConfigLoader(
+            program_path=parsed["program_path"].strip(),
+            tests_path=parsed["tests_path"].strip(),
+            operators_list=operators_list,
         )
-        return self._program_ast
 
-    def applyMutation(self, operator: "Operator") -> list[Mutant]:
+        program_file = Path(self.config.program_path)
+        if not program_file.exists():
+            raise FileNotFoundError(
+                f"[MutationManager.load] PySpark program not found: "
+                f"{program_file}"
+            )
+
+        self.code_original = program_file.read_text(encoding="utf-8")
+
+        if not self.code_original.strip():
+            raise ValueError(
+                f"[MutationManager.load] Program file is empty: "
+                f"{program_file}"
+            )
+
+        logger.info(
+            "[MutationManager.load] Config loaded — program: %s | "
+            "tests: %s | operators: %s",
+            self.config.program_path,
+            self.config.tests_path,
+            self.config.operators_list,
+        )
+        return self
+
+    def parse_to_ast(self) -> "MutationManager":
         """
-        Generate one mutant per node registered by ``operator.analyseAST()``.
-
-        For each node in ``operator.registers``:
-          1. Calls ``operator.buildMutate(node)`` to obtain the replacement.
-          2. Deep-copies the original AST.
-          3. Substitutes that exact node instance with the replacement.
-          4. Unparses the mutated tree back to source code.
-          5. Wraps the result in a ``Mutant`` and appends it to
-             ``self.mutateList``.
-
-        The original ``_program_ast`` is never modified.
-
-        Parameters
-        ----------
-        operator : Operator
-            A concrete ``Operator`` subclass that has already had
-            ``analyseAST()`` called, so that ``operator.registers`` is
-            populated with the eligible nodes.
+        Parse ``code_original`` into an AST and store in ``code_ast``.
 
         Returns
         -------
-        list[Mutant]
-            The mutants generated by this call (also stored in
-            ``self.mutateList``).
+        self — for method chaining.
 
         Raises
         ------
         RuntimeError
-            If ``parseToAST`` has not been called yet.
-        TypeError
-            If ``operator`` does not expose the required interface
-            (``name``, ``registers``, ``analyseAST``, ``buildMutate``).
+            If ``load()`` has not been called yet.
         ValueError
-            If ``operator.registers`` is empty (``analyseAST`` was not
-            called or found no eligible nodes).
+            If ``code_original`` contains a syntax error.
+        """
+        self._assert_loaded()
+
+        try:
+            tree = ast.parse(self.code_original)
+        except SyntaxError as exc:
+            raise ValueError(
+                f"[MutationManager.parse_to_ast] Syntax error at line "
+                f"{exc.lineno}: {exc.msg}"
+            ) from exc
+
+        ast.fix_missing_locations(tree)
+        self.code_ast = tree
+
+        logger.info(
+            "[MutationManager.parse_to_ast] AST ready — %d nodes.",
+            sum(1 for _ in ast.walk(tree)),
+        )
+        return self
+
+    def apply_mutation(self) -> "MutationManager":
+        """
+        For each operator identifier in ``config.operators_list``:
+
+        1. Resolve it to its concrete ``Operator`` subclass via the registry.
+        2. Call ``operator.analyse_ast(self.code_ast)`` to find eligible nodes.
+        3. Call ``operator.build_mutant(nodes, ...)`` to generate mutants and
+           write them to disk.
+        4. Extend ``self.mutant_list`` with the returned mutants.
+
+        Failures in individual operators are logged and skipped; the pipeline
+        continues with the remaining operators.
+
+        Returns
+        -------
+        self — for method chaining.
+
+        Raises
+        ------
+        RuntimeError
+            If ``parse_to_ast()`` has not been called yet.
         """
         self._assert_ast_ready()
-        self._validate_operator(operator)
 
-        if not operator.registers:
-            print(
-                f"[MutationManager] Operator '{operator.name}': "
-                f"registers is empty — call analyseAST() first or no "
-                f"eligible nodes exist in the current AST."
-            )
-            return []
+        mutant_dir = self._ensure_mutant_dir()
 
-        new_mutants: list[Mutant] = []
-
-        for idx, target_node in enumerate(operator.registers):
-            # Ask the operator how to replace this specific node
-            replacement_node = operator.buildMutate(target_node)
-
-            # Work on a deep copy so the original tree is never mutated
-            tree_copy = copy.deepcopy(self._program_ast)
-
-            # After deep copy, the identity of target_node is gone — find
-            # the equivalent node in the copy by position/index
-            original_nodes = list(ast.walk(self._program_ast))
-            copied_nodes = list(ast.walk(tree_copy))
-
+        for op_name in self.config.operators_list:
             try:
-                node_index = original_nodes.index(target_node)
-                target_in_copy = copied_nodes[node_index]
-            except (ValueError, IndexError):
-                print(
-                    f"[MutationManager] Operator '{operator.name}': "
-                    f"could not locate node at occurrence {idx} in the "
-                    f"copied tree — skipping."
+                operator = self._resolve_operator(op_name)
+            except (KeyError, ImportError, AttributeError) as exc:
+                logger.warning(
+                    "[MutationManager.apply_mutation] Could not load "
+                    "operator '%s': %s — skipping.", op_name, exc
                 )
                 continue
 
-            replacer = _NodeReplacer(
-                target_node=target_in_copy,
-                replacement_node=replacement_node,
-            )
-            mutated_tree = replacer.visit(tree_copy)
-            ast.fix_missing_locations(mutated_tree)
+            try:
+                nodes = operator.analyse_ast(self.code_ast)
 
-            mutant_source = ast.unparse(mutated_tree)
+                if not nodes:
+                    logger.info(
+                        "[MutationManager.apply_mutation] Operator '%s': "
+                        "no eligible nodes found — skipping.", op_name
+                    )
+                    continue
 
-            mutant = Mutant(
-                operator_name=operator.name,
-                occurrence_index=idx,
-                source_code=mutant_source,
-            )
-            new_mutants.append(mutant)
-            self.mutateList.append(mutant)
+                mutants = operator.build_mutant(
+                    nodes=nodes,
+                    original_ast=self.code_ast,
+                    original_path=self.config.program_path,
+                    mutant_dir=str(mutant_dir),
+                )
+                self.mutant_list.extend(mutants)
 
-        print(
-            f"[MutationManager] Operator '{operator.name}': "
-            f"{len(new_mutants)} mutant(s) generated from "
-            f"{len(operator.registers)} registered node(s)."
+                logger.info(
+                    "[MutationManager.apply_mutation] Operator '%s': "
+                    "%d mutant(s) generated.", op_name, len(mutants)
+                )
+
+            except Exception as exc:          # noqa: BLE001
+                logger.warning(
+                    "[MutationManager.apply_mutation] Operator '%s' "
+                    "raised an error: %s — skipping.", op_name, exc
+                )
+
+        logger.info(
+            "[MutationManager.apply_mutation] Total mutants generated: %d.",
+            len(self.mutant_list),
         )
-        return new_mutants
+        return self
 
-    # ------------------------------------------------------------------ #
-    # Properties                                                           #
-    # ------------------------------------------------------------------ #
+    def run_tests(self) -> "MutationManager":
+        """
+        Pass ``mutant_list`` and ``config`` to ``TestRunner`` and collect
+        ``TestResult`` instances into ``result_list``.
 
-    @property
-    def program_ast(self) -> ast.AST:
-        """The parsed AST. Available after ``parseToAST()``."""
-        self._assert_ast_ready()
-        return self._program_ast
+        Returns
+        -------
+        self — for method chaining.
 
-    @property
-    def program_source(self) -> str:
-        """The raw source that was parsed. Available after ``parseToAST()``."""
-        self._assert_ast_ready()
-        return self._program_source
+        Raises
+        ------
+        RuntimeError
+            If ``apply_mutation()`` has not been called yet (empty
+            ``mutant_list``).
+        """
+        self._assert_mutants_ready()
+
+        from .test_runner import TestRunner
+
+        runner = TestRunner(
+            mutant_list=self.mutant_list,
+            config=self.config,
+        )
+        self.result_list = runner.run_test()
+
+        logger.info(
+            "[MutationManager.run_tests] %d result(s) collected.",
+            len(self.result_list),
+        )
+        return self
+
+    def agregate_results(self) -> "MutationManager":
+        """
+        Pass ``result_list``, ``code_original`` and ``mutant_list`` to
+        ``Report`` and execute the full reporting sequence:
+        ``calculate() → show_results() → make_diff()``.
+
+        Returns
+        -------
+        self — for method chaining.
+
+        Raises
+        ------
+        RuntimeError
+            If ``run_tests()`` has not been called yet (empty
+            ``result_list``).
+        """
+        self._assert_results_ready()
+
+        from .reporter import Reporter
+
+        reporter = Reporter(
+            result_list=self.result_list,
+            code_original=self.code_original,
+            mutant_list=self.mutant_list,
+        )
+        reporter.calculate()
+        reporter.make_diff()
+        reporter.show_results()
+
+        logger.info("[MutationManager.agregate_results] Reporting complete.")
+        return self
 
     # ------------------------------------------------------------------ #
     # Private helpers                                                      #
     # ------------------------------------------------------------------ #
 
-    def _validate_config_loader(self) -> None:
-        """Duck-type check: configLoader must expose the required attributes."""
-        required_attrs = ("program_source", "workspace_path", "operatorsList")
-        for attr in required_attrs:
-            if not hasattr(self.configLoader, attr):
-                raise TypeError(
-                    f"[MutationManager] configLoader is missing attribute "
-                    f"'{attr}'. Pass a loaded ConfigLoader instance."
-                )
-        try:
-            _ = self.configLoader.program_source
-        except RuntimeError as exc:
+    def _resolve_operator(self, op_name: str) -> "Operator":
+        """
+        Dynamically import and instantiate the concrete Operator subclass
+        registered under ``op_name``.
+
+        Raises
+        ------
+        KeyError
+            If ``op_name`` is not in ``_OPERATOR_REGISTRY``.
+        ImportError / AttributeError
+            If the module or class cannot be loaded.
+        """
+        key = op_name.strip().upper()
+        if key not in _OPERATOR_REGISTRY:
+            raise KeyError(
+                f"[MutationManager] Operator '{key}' is not registered. "
+                f"Add it to _OPERATOR_REGISTRY before running the pipeline."
+            )
+        dotted_path          = _OPERATOR_REGISTRY[key]
+        module_path, cls_name = dotted_path.rsplit(".", 1)
+        module               = importlib.import_module(module_path)
+        operator_cls         = getattr(module, cls_name)
+        return operator_cls()
+
+    def _ensure_mutant_dir(self) -> Path:
+        """Create ``<program_path parent>/mutants/`` and return its Path."""
+        mutant_dir = Path(self.config.program_path).parent / "mutants"
+        mutant_dir.mkdir(parents=True, exist_ok=True)
+        return mutant_dir
+
+    @staticmethod
+    def _parse_config_file(raw: str) -> dict[str, str]:
+        """
+        Parse a ``key = value`` text file into a dict.
+        Blank lines and lines starting with ``#`` are ignored.
+        """
+        result: dict[str, str] = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                result[key.strip()] = value.strip()
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Guards                                                               #
+    # ------------------------------------------------------------------ #
+
+    def _validate_config_path(self) -> None:
+        path = Path(self.config_path)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"[MutationManager.load] Config file not found: {path}"
+            )
+        if not path.is_file():
+            raise ValueError(
+                f"[MutationManager.load] config_path must point to a file: "
+                f"{path}"
+            )
+
+    def _assert_loaded(self) -> None:
+        if self.config is None or not self.code_original:
             raise RuntimeError(
-                "[MutationManager] The provided ConfigLoader has not been "
-                "loaded yet. Call configLoader.load() first."
-            ) from exc
-
-    def _validate_mutate_list(self) -> None:
-        if not isinstance(self.mutateList, list):
-            raise TypeError(
-                f"[MutationManager] mutateList must be a list, "
-                f"got: {type(self.mutateList)}"
-            )
-
-    def _validate_source(self, source: str) -> None:
-        if not isinstance(source, str) or not source.strip():
-            raise TypeError(
-                f"[MutationManager] source must be a non-empty string, "
-                f"got: {type(source)}"
-            )
-
-    def _validate_operator(self, operator: object) -> None:
-        """Duck-type check: operator must expose name, registers, and methods."""
-        required_attrs = ("name", "registers", "analyseAST", "buildMutate")
-        for attr in required_attrs:
-            if not hasattr(operator, attr):
-                raise TypeError(
-                    f"[MutationManager] operator is missing attribute / method "
-                    f"'{attr}'. Pass a concrete Operator subclass instance."
-                )
-        if not isinstance(operator.name, str) or not operator.name.strip():
-            raise TypeError(
-                f"[MutationManager] operator.name must be a non-empty string, "
-                f"got: {operator.name!r}"
-            )
-        if not isinstance(operator.registers, list):
-            raise TypeError(
-                f"[MutationManager] operator.registers must be a list, "
-                f"got: {type(operator.registers)}"
+                "[MutationManager] config is not set. Call load() first."
             )
 
     def _assert_ast_ready(self) -> None:
-        if self._program_ast is None:
+        if self.code_ast is None:
             raise RuntimeError(
-                "[MutationManager] AST is not available. "
-                "Call parseToAST(source) first."
+                "[MutationManager] code_ast is not set. "
+                "Call parse_to_ast() first."
+            )
+
+    def _assert_mutants_ready(self) -> None:
+        if not self.mutant_list:
+            raise RuntimeError(
+                "[MutationManager] mutant_list is empty. "
+                "Call apply_mutation() first."
+            )
+
+    def _assert_results_ready(self) -> None:
+        if not self.result_list:
+            raise RuntimeError(
+                "[MutationManager] result_list is empty. "
+                "Call run_tests() first."
             )
 
     # ------------------------------------------------------------------ #
@@ -372,7 +459,9 @@ class MutationManager:
     def __repr__(self) -> str:
         return (
             f"MutationManager("
-            f"ast_ready={self._program_ast is not None}, "
-            f"mutants={len(self.mutateList)}"
+            f"config={'set' if self.config else 'not set'}, "
+            f"ast={'set' if self.code_ast else 'not set'}, "
+            f"mutants={len(self.mutant_list)}, "
+            f"results={len(self.result_list)}"
             f")"
         )

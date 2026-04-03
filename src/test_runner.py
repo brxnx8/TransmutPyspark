@@ -1,148 +1,82 @@
 """
 TestRunner
 ==========
-Responsible for:
-  1. Receiving a list of mutants (from MutationManager) and a loaded
-     ConfigLoader instance.
-  2. For each mutant: writing the mutated source to a temporary .py file,
-     running the project's pytest suite against it via subprocess, and
-     recording the outcome.
-  3. Storing every result in ``self.results``.
+Responsible for executing the project's pytest suite against every mutant
+in ``mutant_list`` and collecting one ``TestResult`` per mutant.
 
 Execution strategy
 ------------------
-Mutants are tested **in parallel** using ``ThreadPoolExecutor``.  Each
-worker spawns an isolated ``pytest`` subprocess, so there is no shared
-state between runs.  The degree of parallelism is capped by
-``max_workers`` (default: ``min(4, cpu_count)``) to avoid saturating the
-machine that also hosts the SparkSession.
+Mutants are tested in parallel using ``ThreadPoolExecutor``. Each worker
+spawns an isolated ``pytest`` subprocess pointed at ``mutant.mutant_path``,
+so there is no shared state between concurrent runs.
+
+The degree of parallelism is capped by ``max_workers``
+(default: ``min(4, cpu_count)``) to avoid competing with the SparkSession
+that may be active in the same environment.
 
 Mutant status
 -------------
 - **killed**   — at least one test failed (pytest exit code 1).
-                 This is the desired outcome: the test suite detected the
-                 mutation.
 - **survived** — all tests passed (pytest exit code 0).
-                 The mutation was NOT caught; the test suite may need to
-                 be strengthened.
-- **error**    — pytest could not run at all (exit codes 2–5, or the
-                 subprocess itself crashed).  Typically caused by an
-                 import error in the mutated file or an environment issue.
+- **timeout**  — pytest did not finish within the time limit.
+- **error**    — pytest could not run at all (exit codes 2-5 or subprocess
+                 crash).
 
 Deliberately out of scope
 --------------------------
-- Generating mutants              → MutationManager
-- Deciding what/how to mutate     → Operator
-- Reporting / aggregating results → Reporter (future)
+- Generating mutants        → Operator.build_mutant()
+- Aggregating / reporting   → Report (called by MutationManager)
 """
 
 import os
 import subprocess
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .test_result import TestResult
+from .config_loader import ConfigLoader
+
 if TYPE_CHECKING:
-    from code.config_loader import ConfigLoader
-    from code.mutation_manager import Mutant
+    from .operator import Mutant
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# TestResult dataclass                                                         #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-@dataclass
-class TestResult:
-    """
-    Outcome of running the test suite against a single mutant.
-
-    Attributes
-    ----------
-    mutant_operator  : Name of the operator that generated the mutant.
-    occurrence_index : Which occurrence within the operator's registers
-                       this mutant corresponds to.
-    status           : ``"killed"``, ``"survived"``, or ``"error"``.
-    stdout           : Captured standard output from the pytest subprocess.
-    stderr           : Captured standard error from the pytest subprocess.
-    exit_code        : Raw pytest process exit code.
-    duration_seconds : Wall-clock time taken to run the test subprocess.
-    """
-
-    mutant_operator:  str
-    occurrence_index: int
-    status:           str
-    stdout:           str
-    stderr:           str
-    exit_code:        int
-    duration_seconds: float
-
-    # Pytest exit-code semantics
-    _EXIT_KILLED   = 1   # tests ran, some failed  → mutation killed
-    _EXIT_SURVIVED = 0   # tests ran, all passed   → mutation survived
-
-    def is_killed(self) -> bool:
-        """Return True if the mutation was detected by the test suite."""
-        return self.status == "killed"
-
-    def is_survived(self) -> bool:
-        """Return True if the mutation went undetected."""
-        return self.status == "survived"
-
-    def is_error(self) -> bool:
-        """Return True if pytest could not execute properly."""
-        return self.status == "error"
-
-    def __repr__(self) -> str:
-        return (
-            f"TestResult("
-            f"operator={self.mutant_operator!r}, "
-            f"occurrence={self.occurrence_index}, "
-            f"status={self.status!r}, "
-            f"exit_code={self.exit_code}, "
-            f"duration={self.duration_seconds:.2f}s"
-            f")"
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# TestRunner                                                                   #
-# ─────────────────────────────────────────────────────────────────────────── #
 
 @dataclass
 class TestRunner:
     """
-    Runs the project's pytest suite against every mutant in ``mutateList``
-    and stores the outcomes in ``results``.
+    Executes the pytest suite against every mutant and returns the results.
 
     Parameters
     ----------
-    mutateList  : list[Mutant]
-        Mutants produced by ``MutationManager.applyMutation()``.
+    mutant_list : list[Mutant]
+        Mutants produced by ``Operator.build_mutant()``, received from
+        ``MutationManager``.  Each mutant already has its source written
+        to ``mutant.mutant_path``.
     config      : ConfigLoader
-        A fully loaded ``ConfigLoader`` instance used to locate the test
-        file, the workspace directory, and the SparkSession.
+        Configuration dataclass providing ``tests_path`` (path to the
+        pytest file) and ``program_path`` (used to resolve the workspace).
     max_workers : int
         Maximum number of parallel pytest subprocesses.
         Defaults to ``min(4, os.cpu_count() or 1)``.
     results     : list[TestResult]
-        Populated by ``runTest()``.  May be pre-seeded for testing
-        purposes but is normally left empty.
+        Populated by ``run_test()``.  Normally left empty on construction.
     """
 
-    mutateList:  list
-    config:      "ConfigLoader"
-    max_workers: int = field(default_factory=lambda: min(4, os.cpu_count() or 1))
-    results:     list[TestResult] = field(default_factory=list)
+    mutant_list: list
+    config:      ConfigLoader
+    max_workers: int               = field(
+        default_factory=lambda: min(4, os.cpu_count() or 1)
+    )
+    results:     list[TestResult]  = field(default_factory=list)
 
     # ------------------------------------------------------------------ #
     # Post-init validation                                                 #
     # ------------------------------------------------------------------ #
 
     def __post_init__(self) -> None:
-        self._validate_mutate_list()
+        self._validate_mutant_list()
         self._validate_config()
         self._validate_max_workers()
 
@@ -150,54 +84,48 @@ class TestRunner:
     # Public API                                                           #
     # ------------------------------------------------------------------ #
 
-    def runTest(self) -> list[TestResult]:
+    def run_test(self) -> list[TestResult]:
         """
-        Execute the pytest suite against every mutant in ``mutateList``
-        in parallel and store each ``TestResult`` in ``self.results``.
+        Execute the pytest suite against every mutant in ``mutant_list``
+        in parallel and return the collected ``TestResult`` instances.
 
-        Steps
-        -----
-        1. Clear any previous results to avoid stale data.
-        2. Submit one task per mutant to a ``ThreadPoolExecutor``.
-        3. Each task writes the mutant source to a temp file inside the
-           workspace's ``mutants/`` subdirectory, then runs::
+        For each mutant the runner:
+          1. Prepends the directory containing ``mutant.mutant_path`` to
+             ``PYTHONPATH`` so the test file imports the mutated module.
+          2. Runs ``pytest <tests_path> -x -q --tb=short`` in a subprocess.
+          3. Wraps the outcome in a ``TestResult`` and appends it to
+             ``self.results``.
 
-               pytest <tests_path> --import-mode=importlib
-                      --override-ini="python_files=*.py"
-                      -x -q
-
-           with the mutant's directory prepended to ``PYTHONPATH`` so the
-           test file imports the mutated module instead of the original.
-        4. Collect results as futures complete and append to
-           ``self.results``.
+        Results are also stored in ``self.results`` so callers can inspect
+        them after the call.
 
         Returns
         -------
         list[TestResult]
-            The same list as ``self.results`` (returned for convenience).
+            One ``TestResult`` per mutant, in completion order.
 
         Raises
         ------
         RuntimeError
-            If ``mutateList`` is empty (nothing to test).
+            If ``mutant_list`` is empty.
         """
-        if not self.mutateList:
+        if not self.mutant_list:
             raise RuntimeError(
-                "[TestRunner] mutateList is empty — nothing to test. "
-                "Call MutationManager.applyMutation() first."
+                "[TestRunner] mutant_list is empty — nothing to test. "
+                "Ensure apply_mutation() ran before run_tests()."
             )
 
         self.results.clear()
 
         print(
-            f"[TestRunner] Starting test run: {len(self.mutateList)} mutant(s), "
+            f"[TestRunner] Starting: {len(self.mutant_list)} mutant(s), "
             f"max_workers={self.max_workers}."
         )
 
-        futures_map = {}
+        futures_map: dict = {}
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            for mutant in self.mutateList:
+            for mutant in self.mutant_list:
                 future = executor.submit(self._run_single_mutant, mutant)
                 futures_map[future] = mutant
 
@@ -205,25 +133,28 @@ class TestRunner:
                 mutant = futures_map[future]
                 try:
                     result = future.result()
-                except Exception as exc:           # unexpected worker crash
+                except Exception as exc:
+                    # Unexpected worker crash — record as error
                     result = TestResult(
-                        mutant_operator=mutant.operator_name,
-                        occurrence_index=mutant.occurrence_index,
+                        mutant=mutant.id,
                         status="error",
-                        stdout="",
-                        stderr=str(exc),
-                        exit_code=-1,
-                        duration_seconds=0.0,
+                        failed_tests=[],
+                        execution_time=0.0,
+                    )
+                    print(
+                        f"[TestRunner] Mutant {mutant.id} worker crashed: "
+                        f"{exc} — recorded as error."
                     )
                 self.results.append(result)
 
-        killed   = sum(1 for r in self.results if r.is_killed())
-        survived = sum(1 for r in self.results if r.is_survived())
-        errors   = sum(1 for r in self.results if r.is_error())
+        killed   = sum(1 for r in self.results if r.status == "killed")
+        survived = sum(1 for r in self.results if r.status == "survived")
+        timeouts = sum(1 for r in self.results if r.status == "timeout")
+        errors   = sum(1 for r in self.results if r.status == "error")
 
         print(
-            f"[TestRunner] Run complete — "
-            f"killed={killed}, survived={survived}, errors={errors}."
+            f"[TestRunner] Done — killed={killed}, survived={survived}, "
+            f"timeout={timeouts}, error={errors}."
         )
         return self.results
 
@@ -233,11 +164,12 @@ class TestRunner:
 
     def _run_single_mutant(self, mutant: "Mutant") -> TestResult:
         """
-        Write one mutant to a temp file and run pytest against it.
+        Run pytest against a single mutant file and return a ``TestResult``.
 
-        The mutant file is written to a unique subdirectory inside
-        ``<workspace>/mutants/`` so concurrent runs never collide.
-        The directory is cleaned up automatically after the run.
+        The mutant file already exists at ``mutant.mutant_path`` (written
+        by ``Operator.build_mutant``).  Its parent directory is prepended
+        to ``PYTHONPATH`` so that ``import <module>`` inside the test file
+        resolves to the mutated version.
 
         Parameters
         ----------
@@ -247,83 +179,72 @@ class TestRunner:
         Returns
         -------
         TestResult
-            The outcome for this mutant.
+            Outcome for this mutant.
         """
-        mutants_dir = self.config.workspace_path / "mutants"
-        mutants_dir.mkdir(parents=True, exist_ok=True)
+        mutant_path = Path(mutant.mutant_path)
+        mutant_dir  = str(mutant_path.parent)
 
-        # Derive the original program module name from its path
-        original_module_name = Path(self.config.programPath).stem
+        # Inject mutant directory at the front of PYTHONPATH
+        env = os.environ.copy()
+        existing_path = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            os.pathsep.join([mutant_dir, existing_path])
+            if existing_path
+            else mutant_dir
+        )
 
-        # Create an isolated temp directory for this mutant
-        with tempfile.TemporaryDirectory(dir=mutants_dir) as tmp_dir:
-            mutant_file = Path(tmp_dir) / f"{original_module_name}.py"
-            mutant_file.write_text(mutant.source_code, encoding="utf-8")
+        cmd = [
+            "pytest",
+            str(self.config.tests_path),
+            "-x",
+            "-q",
+            "--tb=short",
+            "--import-mode=importlib",
+        ]
 
-            # Build the environment: inject the mutant's directory first
-            # so the test file imports the mutated module, not the original
-            env = os.environ.copy()
-            python_path_parts = [str(tmp_dir)]
-            if existing := env.get("PYTHONPATH"):
-                python_path_parts.append(existing)
-            env["PYTHONPATH"] = os.pathsep.join(python_path_parts)
+        start = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=120,
+            )
 
-            cmd = [
-                "pytest",
-                str(self.config.testsPath),
-                "--import-mode=importlib",
-                "-x",     # stop after first failure — faster kill detection
-                "-q",     # quiet output
-                "--tb=short",
-            ]
+            duration     = time.perf_counter() - start
+            status       = self._classify(proc.returncode)
+            failed_tests = self._extract_failed_tests(proc.stdout)
 
-            start = time.perf_counter()
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    env=env,
-                    timeout=120,   # safety valve: 2 minutes per mutant
-                )
-                duration = time.perf_counter() - start
-                status   = self._classify(proc.returncode)
+            return TestResult(
+                mutant=mutant.id,
+                status=status,
+                failed_tests=failed_tests,
+                execution_time=round(duration, 4),
+            )
 
-                return TestResult(
-                    mutant_operator=mutant.operator_name,
-                    occurrence_index=mutant.occurrence_index,
-                    status=status,
-                    stdout=proc.stdout,
-                    stderr=proc.stderr,
-                    exit_code=proc.returncode,
-                    duration_seconds=duration,
-                )
-
-            except subprocess.TimeoutExpired as exc:
-                duration = time.perf_counter() - start
-                return TestResult(
-                    mutant_operator=mutant.operator_name,
-                    occurrence_index=mutant.occurrence_index,
-                    status="error",
-                    stdout=exc.stdout or "",
-                    stderr=f"Timeout after {duration:.1f}s",
-                    exit_code=-1,
-                    duration_seconds=duration,
-                )
+        except subprocess.TimeoutExpired:
+            duration = time.perf_counter() - start
+            return TestResult(
+                mutant=mutant.id,
+                status="timeout",
+                failed_tests=[],
+                execution_time=round(duration, 4),
+            )
 
     @staticmethod
     def _classify(exit_code: int) -> str:
         """
         Map a pytest exit code to a mutant status string.
 
-        Pytest exit codes
-        -----------------
-        0 — all tests passed            → survived
-        1 — some tests failed           → killed
-        2 — interrupted (e.g. Ctrl-C)  → error
-        3 — internal pytest error       → error
-        4 — command-line usage error    → error
-        5 — no tests collected          → error
+        Codes
+        -----
+        0 → survived  (all tests passed)
+        1 → killed    (at least one test failed)
+        2 → error     (interrupted)
+        3 → error     (internal pytest error)
+        4 → error     (command-line usage error)
+        5 → error     (no tests collected)
         """
         if exit_code == 0:
             return "survived"
@@ -331,38 +252,57 @@ class TestRunner:
             return "killed"
         return "error"
 
+    @staticmethod
+    def _extract_failed_tests(stdout: str) -> list[str]:
+        """
+        Parse pytest's ``-q`` output and return a list of failed test ids.
+
+        Pytest prints each failure as ``FAILED path::test_name`` on its
+        own line — this method collects those names.
+
+        Parameters
+        ----------
+        stdout : str
+            Captured standard output from the pytest subprocess.
+
+        Returns
+        -------
+        list[str]
+            Failed test identifiers, empty if none found.
+        """
+        failed: list[str] = []
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("FAILED "):
+                test_id = stripped[len("FAILED "):].strip()
+                failed.append(test_id)
+        return failed
+
     # ------------------------------------------------------------------ #
     # Validators                                                           #
     # ------------------------------------------------------------------ #
 
-    def _validate_mutate_list(self) -> None:
-        if not isinstance(self.mutateList, list):
+    def _validate_mutant_list(self) -> None:
+        if not isinstance(self.mutant_list, list):
             raise TypeError(
-                f"[TestRunner] mutateList must be a list, "
-                f"got: {type(self.mutateList)}"
+                f"[TestRunner] mutant_list must be a list, "
+                f"got: {type(self.mutant_list)}"
             )
 
     def _validate_config(self) -> None:
-        required_attrs = (
-            "programPath",
-            "testsPath",
-            "workspace_path",
-            "sparkSession",
-        )
-        for attr in required_attrs:
-            if not hasattr(self.config, attr):
-                raise TypeError(
-                    f"[TestRunner] config is missing attribute '{attr}'. "
-                    f"Pass a loaded ConfigLoader instance."
-                )
-        # Trigger _assert_loaded inside ConfigLoader
-        try:
-            _ = self.config.workspace_path
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "[TestRunner] The provided ConfigLoader has not been loaded "
-                "yet. Call config.load() first."
-            ) from exc
+        if not isinstance(self.config, ConfigLoader):
+            raise TypeError(
+                f"[TestRunner] config must be a ConfigLoader instance, "
+                f"got: {type(self.config)}"
+            )
+        if not self.config.tests_path or not self.config.tests_path.strip():
+            raise ValueError(
+                "[TestRunner] config.tests_path must be a non-empty string."
+            )
+        if not Path(self.config.tests_path).exists():
+            raise FileNotFoundError(
+                f"[TestRunner] tests_path not found: {self.config.tests_path}"
+            )
 
     def _validate_max_workers(self) -> None:
         if not isinstance(self.max_workers, int) or self.max_workers < 1:
@@ -378,7 +318,7 @@ class TestRunner:
     def __repr__(self) -> str:
         return (
             f"TestRunner("
-            f"mutants={len(self.mutateList)}, "
+            f"mutants={len(self.mutant_list)}, "
             f"results={len(self.results)}, "
             f"max_workers={self.max_workers}"
             f")"
