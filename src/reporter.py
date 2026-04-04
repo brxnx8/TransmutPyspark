@@ -105,7 +105,7 @@ class Reporter:
             "diff_original_code": [],   # populated by make_diff()
         })
 
-        logger.info(f"[Reporter.calculate] Score={score:.2%} | killed={killed} survived={survived} timeout={timeout} error={error} total={total}")
+        logger.info(f"[Reporter.calculate] MutationScore={score:.2%} | killed={killed} survived={survived} timeout={timeout} error={error} total={total}")
         return self
 
     def make_diff(self) -> "Reporter":
