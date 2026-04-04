@@ -4,7 +4,7 @@ from pyspark.sql import SparkSession, Row
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 from pyspark.testing.utils import assertDataFrameEqual
 from pyspark.sql.functions import unix_timestamp, col, coalesce, lit, when
-from etl_project_example.etl_code.etl import mtr_function
+from mtr import mtr_function
 
 
 def test_mtr_function_calculos_e_anomalias(spark_session):
