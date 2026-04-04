@@ -26,6 +26,7 @@ import difflib
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -184,8 +185,10 @@ class Reporter:
         """
         self._assert_calculated()
 
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
         output_dir  = self._resolve_output_dir()
-        output_path = output_dir / "report.html"
+        output_path = output_dir / f"report_{timestamp}.html"
 
         html = self._build_html()
         output_path.write_text(html, encoding="utf-8")
