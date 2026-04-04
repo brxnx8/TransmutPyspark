@@ -31,17 +31,19 @@ Deliberately out of scope
 import os
 import subprocess
 import time
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .test_result import TestResult
-from .config_loader import ConfigLoader
+from src.test_result import TestResult
+from src.config_loader import ConfigLoader
 
 if TYPE_CHECKING:
-    from .operator import Mutant
+    from src.operator import Mutant
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class TestRunner:
@@ -117,10 +119,7 @@ class TestRunner:
 
         self.results.clear()
 
-        print(
-            f"[TestRunner] Starting: {len(self.mutant_list)} mutant(s), "
-            f"max_workers={self.max_workers}."
-        )
+        logger.info(f"[TestRunner.run_test] Starting: {len(self.mutant_list)} mutant(s), max_workers={self.max_workers}.")
 
         futures_map: dict = {}
 
@@ -141,10 +140,7 @@ class TestRunner:
                         failed_tests=[],
                         execution_time=0.0,
                     )
-                    print(
-                        f"[TestRunner] Mutant {mutant.id} worker crashed: "
-                        f"{exc} — recorded as error."
-                    )
+                    logger.error(f"[TestRunner.run_test] Mutant {mutant.id} worker crashed: {exc} — recorded as error.")
                 self.results.append(result)
 
         killed   = sum(1 for r in self.results if r.status == "killed")
@@ -152,9 +148,8 @@ class TestRunner:
         timeouts = sum(1 for r in self.results if r.status == "timeout")
         errors   = sum(1 for r in self.results if r.status == "error")
 
-        print(
-            f"[TestRunner] Done — killed={killed}, survived={survived}, "
-            f"timeout={timeouts}, error={errors}."
+        logger.info(
+            f"[TestRunner.run_test] Done — killed={killed}, survived={survived}, timeout={timeouts}, error={errors}"
         )
         return self.results
 
@@ -184,14 +179,22 @@ class TestRunner:
         mutant_path = Path(mutant.mutant_path)
         mutant_dir  = str(mutant_path.parent)
 
-        # Inject mutant directory at the front of PYTHONPATH
+        # Inject mutant directory at the front of PYTHONPATH while preserving
+        # site-packages so imports like pyspark are resolved correctly
         env = os.environ.copy()
-        existing_path = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = (
-            os.pathsep.join([mutant_dir, existing_path])
-            if existing_path
-            else mutant_dir
-        )
+        current_pythonpath = env.get("PYTHONPATH", "").strip()
+        
+        # Add spark python directory to path if not already there
+        spark_python_path = "/opt/bitnami/spark/python"
+        path_parts = [mutant_dir]
+        
+        if spark_python_path not in current_pythonpath:
+            path_parts.append(spark_python_path)
+        
+        if current_pythonpath:
+            path_parts.append(current_pythonpath)
+        
+        env["PYTHONPATH"] = os.pathsep.join(path_parts)
 
         cmd = [
             "pytest",
@@ -199,7 +202,6 @@ class TestRunner:
             "-x",
             "-q",
             "--tb=short",
-            "--import-mode=importlib",
         ]
 
         start = time.perf_counter()

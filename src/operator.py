@@ -35,10 +35,15 @@ Deliberately out of scope
 """
 
 import ast
+import logging
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from .mutant import Mutant
+
+from src.mutant import Mutant
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -174,7 +179,64 @@ class Operator(ABC):
         mutation rounds.
         """
         self.mutant_list.clear()
-        print(f"[Operator:{self.name}] mutant_list cleared.")
+        logger.info(f"[Operator:{self.name}] mutant_list cleared.")
+
+    # ------------------------------------------------------------------ #
+    # Logging helpers — centralized log output for all operators           #
+    # ------------------------------------------------------------------ #
+
+    def _log_analyse_ast_found(self, count: int, description: str) -> None:
+        """
+        Log the number of eligible nodes found by ``analyse_ast``.
+
+        Parameters
+        ----------
+        count : int
+            Number of eligible nodes found.
+        description : str
+            Human-readable description of what was searched for.
+            Example: "mapping transformation calls with function arguments"
+        """
+        logger.info(
+            f"[{self.__class__.__name__}.analyse_ast] Found {count} eligible "
+            f"call site(s) ({description})."
+        )
+
+    def _log_skipping_node(self, reason: str) -> None:
+        """
+        Log that a node or sub-node is being skipped due to validation failure.
+
+        Parameters
+        ----------
+        reason : str
+            Human-readable reason why this node is being skipped.
+            Example: "Call at line 42: no eligible sub-conditions found"
+        """
+        logger.warning(f"[{self.__class__.__name__}.build_mutant] {reason} — skipping.")
+
+    def _log_mutant_created(self, mutant_id: int, details: str) -> None:
+        """
+        Log that a mutant was successfully created.
+
+        Parameters
+        ----------
+        mutant_id : int
+            The numeric ID of the mutant.
+        details : str
+            Extra details about the mutation.
+            Example: "call line 9 (.withColumn), replacement 'zero': ...[subdir/file.py]"
+        """
+        logger.info(
+            f"[{self.__class__.__name__}.build_mutant] Mutant {mutant_id} created "
+            f"— {details}"
+        )
+
+    def _log_build_mutant_done(self) -> None:
+        """Log the completion of ``build_mutant`` with the final mutant count."""
+        logger.info(
+            f"[{self.__class__.__name__}.build_mutant] Done — "
+            f"{len(self.mutant_list)} total mutant(s) generated."
+        )
 
     # ------------------------------------------------------------------ #
     # Protected guards — call these inside subclass implementations        #

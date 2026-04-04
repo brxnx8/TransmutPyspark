@@ -46,14 +46,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .config_loader import ConfigLoader
+from src.config_loader import ConfigLoader
 
 if TYPE_CHECKING:
-    from .operator import Operator
-    from .mutant import Mutant
-    from .test_runner import TestRunner
-    from .test_result import TestResult
-    from .reporter import Reporter
+    from src.operator import Operator
+    from src.mutant import Mutant
+    from src.test_runner import TestRunner
+    from src.test_result import TestResult
+    from src.reporter import Reporter
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 _OPERATOR_REGISTRY: dict[str, str] = {
      "NFTP": "src.operator_nftp.OperatorNFTP",
-    # "ROR": "code.operators.ror_operator.ROROperator",
+     "MTR" : "src.operator_mtr.OperatorMTR",
     # "LCR": "code.operators.lcr_operator.LCROperator",
 }
 
@@ -313,7 +313,7 @@ class MutationManager:
         """
         self._assert_mutants_ready()
 
-        from .test_runner import TestRunner
+        from src.test_runner import TestRunner
 
         runner = TestRunner(
             mutant_list=self.mutant_list,
@@ -345,13 +345,16 @@ class MutationManager:
         """
         self._assert_results_ready()
 
-        from .reporter import Reporter
+        from src.reporter import Reporter
 
         reporter = Reporter(
             result_list=self.result_list,
             code_original=self.code_original,
             mutant_list=self.mutant_list,
         )
+        
+        logger.info("[MutationManager.agregate_results] Generating report...")
+
         reporter.calculate()
         reporter.make_diff()
         reporter.show_results()

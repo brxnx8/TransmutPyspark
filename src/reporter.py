@@ -24,6 +24,7 @@ Deliberately out of scope
 
 import difflib
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,7 +32,9 @@ from typing import TYPE_CHECKING
 from .test_result import TestResult
 
 if TYPE_CHECKING:
-    from .operator import Mutant
+    from src.operator import Mutant
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -102,11 +105,7 @@ class Reporter:
             "diff_original_code": [],   # populated by make_diff()
         })
 
-        print(
-            f"[Reporter.calculate] Score={score:.2%} | "
-            f"killed={killed} survived={survived} "
-            f"timeout={timeout} error={error} total={total}"
-        )
+        logger.info(f"[Reporter.calculate] Score={score:.2%} | killed={killed} survived={survived} timeout={timeout} error={error} total={total}")
         return self
 
     def make_diff(self) -> "Reporter":
@@ -144,10 +143,8 @@ class Reporter:
                     encoding="utf-8"
                 )
             except (FileNotFoundError, OSError) as exc:
-                print(
-                    f"[Reporter.make_diff] Could not read mutant file "
-                    f"'{mutant.mutant_path}': {exc} — skipping."
-                )
+                logger.error(f"[Reporter.make_diff] Could not read mutant file ")
+                logger.warning(f"'{mutant.mutant_path}': {exc} — skipping.")
                 continue
 
             diff_lines = difflib.unified_diff(
@@ -164,7 +161,7 @@ class Reporter:
 
         self.result_calculate["diff_original_code"] = diffs
 
-        print(f"[Reporter.make_diff] {len(diffs)} diff(s) generated.")
+        logger.info(f"[Reporter.make_diff] {len(diffs)} diff(s) generated.")
         return self
 
     def show_results(self) -> "Reporter":
@@ -193,7 +190,7 @@ class Reporter:
         html = self._build_html()
         output_path.write_text(html, encoding="utf-8")
 
-        print(f"[Reporter.show_results] Report saved to: {output_path}")
+        logger.info(f"[Reporter.show_results] Report saved to: {output_path}")
         return self
 
     # ------------------------------------------------------------------ #

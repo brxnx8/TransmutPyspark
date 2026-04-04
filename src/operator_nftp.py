@@ -55,11 +55,13 @@ Relationship with MutationManager
 
 import ast
 import copy
+import logging
 from pathlib import Path
 
-from .operator import Operator
-from .mutant import Mutant
+from src.operator import Operator
+from src.mutant import Mutant
 
+logger = logging.getLogger(__name__)
 
 class OperatorNFTP(Operator):
     """
@@ -130,9 +132,9 @@ class OperatorNFTP(Operator):
                 continue
             eligible.append(node)
 
-        print(
-            f"[NFTPOperator.analyse_ast] Found {len(eligible)} eligible "
-            f"call site(s) (.filter / .where with a predicate argument)."
+        self._log_analyse_ast_found(
+            len(eligible),
+            ".filter / .where with a predicate argument"
         )
         return eligible
 
@@ -151,6 +153,21 @@ class OperatorNFTP(Operator):
         For each eligible call node, decompose its predicate into atomic
         sub-conditions and generate one mutant per sub-condition by wrapping
         it in ``not (...)``.
+
+        Directory structure for mutant files::
+
+            mutants/
+            ├── nftp_1_filter_line42/
+            │   └── nftp.py
+            ├── nftp_2_where_line15/
+            │   └── nftp.py
+            ├── nftp_3_filter_line42/
+            │   └── nftp.py
+            ...
+
+        Each subdirectory is named ``nftp_<mutant_id>_<method>_line<lineno>``
+        where ``<method>`` is "filter" or "where", and ``<lineno>`` indicates
+        the line of the negated sub-condition.
 
         Steps per call node
         -------------------
@@ -217,10 +234,9 @@ class OperatorNFTP(Operator):
             sub_conditions = self._collect_subconditions(predicate)
 
             if not sub_conditions:
-                print(
-                    f"[NFTPOperator.build_mutant] Call at line {call_lineno}: "
-                    f"no eligible sub-conditions found (all already negated?) "
-                    f"— skipping."
+                self._log_skipping_node(
+                    f"Call at line {call_lineno}: no eligible sub-conditions found "
+                    f"(all already negated?)"
                 )
                 continue
 
@@ -235,9 +251,8 @@ class OperatorNFTP(Operator):
                     tree_copy, call_lineno, call_col_offset
                 )
                 if call_copy is None:
-                    print(
-                        f"[NFTPOperator.build_mutant] Could not relocate "
-                        f"call at line {call_lineno} in AST copy — skipping."
+                    self._log_skipping_node(
+                        f"Could not relocate call at line {call_lineno} in AST copy"
                     )
                     continue
 
@@ -248,9 +263,8 @@ class OperatorNFTP(Operator):
                     predicate_copy, sub_lineno, sub_col_offset
                 )
                 if sub_copy is None:
-                    print(
-                        f"[NFTPOperator.build_mutant] Could not relocate "
-                        f"sub-condition at line {sub_lineno} — skipping."
+                    self._log_skipping_node(
+                        f"Could not relocate sub-condition at line {sub_lineno}"
                     )
                     continue
 
@@ -274,10 +288,12 @@ class OperatorNFTP(Operator):
                 ast.fix_missing_locations(tree_copy)
                 mutant_source = ast.unparse(tree_copy)
 
-                mutant_id   = self._next_mutant_id()
-                mutant_subdir = mutant_dir_path / f"nftp_{mutant_id}"
+                mutant_id     = self._next_mutant_id()
+                method_name   = call_node.func.attr
+                subdir_name   = f"nftp_{mutant_id}_{method_name}_line{sub_lineno}"
+                mutant_subdir = mutant_dir_path / subdir_name
                 mutant_subdir.mkdir(parents=True, exist_ok=True)
-                mutant_path = mutant_subdir / Path(original_path).name
+                mutant_path   = mutant_subdir / "nftp.py"
                 mutant_path.write_text(mutant_source, encoding="utf-8")
 
                 modified_line = self._get_source_line(
@@ -293,16 +309,13 @@ class OperatorNFTP(Operator):
                 )
                 self.mutant_list.append(mutant)
 
-                print(
-                    f"[NFTPOperator.build_mutant] Mutant {mutant_id} created "
-                    f"— call line {call_lineno}, sub-condition line "
-                    f"{sub_lineno}: {modified_line.strip()!r} [{mutant_path.name}]"
+                self._log_mutant_created(
+                    mutant_id,
+                    f"call line {call_lineno}, sub-condition line {sub_lineno}: "
+                    f"{modified_line.strip()!r} [{mutant_path.name}]"
                 )
 
-        print(
-            f"[NFTPOperator.build_mutant] Done — "
-            f"{len(self.mutant_list)} total mutant(s) generated."
-        )
+        self._log_build_mutant_done()
         return self.mutant_list
 
     # ------------------------------------------------------------------ #
@@ -461,7 +474,7 @@ class OperatorNFTP(Operator):
         try:
             return Path(original_path).read_text(encoding="utf-8").splitlines()
         except (FileNotFoundError, OSError) as exc:
-            print(
+            logger.warnig(
                 f"[NFTPOperator] Warning: could not read source file "
                 f"'{original_path}': {exc}. modified_line will be empty."
             )
