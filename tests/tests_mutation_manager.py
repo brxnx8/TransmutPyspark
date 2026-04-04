@@ -1,626 +1,761 @@
 """
-Unit tests for MutationManager (refactored)
-=============================================
+Unit tests for MutationManager (orchestrator)
+===============================================
 Coverage targets
 ----------------
-- __post_init__              : valid construction, TypeError on bad configLoader
-                               (each missing attr), RuntimeError on unloaded
-                               configLoader, TypeError on bad mutateList
-- parseToAST()               : TypeError (non-string, empty, whitespace),
-                               ValueError (syntax error), success (returns AST,
-                               stores source + AST, fix_missing_locations),
-                               clears mutateList on second call,
-                               second call with empty list (no-op branch)
-- applyMutation()            : RuntimeError before parseToAST,
-                               TypeError (missing each required attr,
-                               bad operator.name, bad operator.registers),
-                               empty registers → returns [],
-                               single node → 1 mutant,
-                               multiple nodes → N mutants,
-                               node-not-found branch (skip),
-                               original AST never modified,
-                               mutateList accumulation across operators,
-                               buildMutate called once per registered node
-- program_ast property       : RuntimeError before parse, correct value after
-- program_source property    : RuntimeError before parse, correct value after
-- _assert_ast_ready()        : RuntimeError / no error
-- _NodeReplacer              : identity match replaces node,
-                               non-matching node left intact,
-                               deep-copies replacement template
-- Mutant.__repr__            : fields present, newline escaping, truncation
-- MutationManager.__repr__   : ast_ready flag, mutant count
+- __post_init__            : valid path, empty string, non-string, whitespace
+- load()                   : FileNotFoundError (config missing, program missing),
+                             ValueError (missing keys, empty program file),
+                             success (config populated, code_original read),
+                             method chaining, blank/comment lines in config,
+                             operators normalised to uppercase
+- parse_to_ast()           : RuntimeError before load, ValueError on syntax
+                             error, success (AST stored, fix_missing_locations),
+                             method chaining
+- apply_mutation()         : RuntimeError before parse_to_ast,
+                             unregistered operator skipped (KeyError),
+                             ImportError skipped, AttributeError skipped,
+                             operator with no eligible nodes skipped,
+                             operator exception skipped,
+                             mutants accumulated across operators,
+                             method chaining, mutant_dir created
+- run_tests()              : RuntimeError before apply_mutation,
+                             delegates to TestRunner, result_list populated,
+                             method chaining
+- agregate_results()       : RuntimeError before run_tests, delegates to
+                             Reporter (calculate, make_diff, show_results
+                             called in order), method chaining
+- _resolve_operator()      : KeyError on unknown, ImportError propagated,
+                             AttributeError propagated, success,
+                             name normalised to uppercase
+- _ensure_mutant_dir()     : creates directory, returns correct Path, idempotent
+- _parse_config_file()     : key=value, blank lines, comment lines,
+                             lines without '=', values with '=' in them,
+                             whitespace stripped, empty input, only comments
+- _validate_config_path()  : FileNotFoundError, ValueError (dir not file)
+- _assert_loaded()         : RuntimeError when config None, when source empty,
+                             no error when ready
+- _assert_ast_ready()      : RuntimeError when None, no error when set
+- _assert_mutants_ready()  : RuntimeError when empty, no error when populated
+- _assert_results_ready()  : RuntimeError when empty, no error when populated
+- __repr__                 : before and after each pipeline step
 
 Run with:
     pytest test_mutation_manager.py -v \
-        --cov=code.mutation_manager \
+        --cov=src.mutation_manager \
         --cov-report=term-missing
 """
 
 import ast
-import copy
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
-from unittest.mock import MagicMock, PropertyMock
 
-from code.mutation_manager import MutationManager, Mutant, _NodeReplacer
-
-
-# ═══════════════════════════════════════════════════════════════════════════ #
-# Source code constants                                                       #
-# ═══════════════════════════════════════════════════════════════════════════ #
-
-SRC_ONE_ADD       = "x = 1 + 2"
-SRC_TWO_ADDS      = "x = 1 + 2 + 3"
-SRC_THREE_ADDS    = "a = 1 + 2\nb = 3 + 4\nc = a + b"
-SRC_NO_ADD        = "x = 1"
-SRC_SYNTAX_ERROR  = "def foo(:\n    pass"
+from src.mutation_manager import MutationManager, _OPERATOR_REGISTRY
+from src.config_loader import ConfigLoader
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
-# Helpers                                                                     #
+# Helpers / factories                                                         #
 # ═══════════════════════════════════════════════════════════════════════════ #
 
-def _make_config(source: str = SRC_ONE_ADD) -> MagicMock:
-    """Return a mock ConfigLoader that satisfies duck-type checks."""
-    cfg = MagicMock()
-    cfg.program_source = source
-    cfg.workspace_path = "/tmp/ws"
-    cfg.operatorsList  = ["AOR"]
+VALID_PROGRAM        = "x = 1 + 2\ny = x * 3\n"
+SYNTAX_ERROR_PROGRAM = "def foo(:\n    pass\n"
+
+
+def _write_program(tmp_path: Path,
+                   content: str = VALID_PROGRAM) -> Path:
+    f = tmp_path / "spark_job.py"
+    f.write_text(content, encoding="utf-8")
+    return f
+
+
+def _write_tests(tmp_path: Path) -> Path:
+    f = tmp_path / "test_suite.py"
+    f.write_text("def test_placeholder(): pass\n", encoding="utf-8")
+    return f
+
+
+def _write_config(tmp_path: Path,
+                  program_path: str | None = None,
+                  tests_path:   str | None = None,
+                  operators:    str = "NFTP",
+                  extra_lines:  str = "") -> Path:
+    program_path = program_path or str(tmp_path / "spark_job.py")
+    tests_path   = tests_path   or str(tmp_path / "test_suite.py")
+    content = (
+        f"program_path   = {program_path}\n"
+        f"tests_path     = {tests_path}\n"
+        f"operators_list = {operators}\n"
+        f"{extra_lines}"
+    )
+    cfg = tmp_path / "config.txt"
+    cfg.write_text(content, encoding="utf-8")
     return cfg
 
 
-def _make_operator(name: str = "AOR",
-                   registers: list | None = None,
-                   replacement: ast.AST | None = None) -> MagicMock:
-    """
-    Return a mock Operator with the full interface MutationManager expects.
-    ``buildMutate`` always returns a deep-copy of ``replacement`` (default Sub).
-    """
-    if replacement is None:
-        replacement = ast.Sub()
-
-    op = MagicMock()
-    op.name        = name
-    op.registers   = registers if registers is not None else []
-    op.analyseAST  = MagicMock(return_value=op.registers)
-    op.buildMutate = MagicMock(side_effect=lambda _: copy.deepcopy(replacement))
-    return op
+def _make_manager(tmp_path: Path,
+                  program_content: str = VALID_PROGRAM,
+                  operators: str = "NFTP") -> MutationManager:
+    _write_program(tmp_path, program_content)
+    _write_tests(tmp_path)
+    cfg = _write_config(tmp_path, operators=operators)
+    return MutationManager(str(cfg))
 
 
-def _add_nodes_from(manager: MutationManager) -> list[ast.AST]:
-    """Return the actual ast.Add node instances from the manager's AST."""
-    return [n for n in ast.walk(manager._program_ast) if isinstance(n, ast.Add)]
+def _loaded(tmp_path: Path, **kwargs) -> MutationManager:
+    return _make_manager(tmp_path, **kwargs).load()
 
 
-# ═══════════════════════════════════════════════════════════════════════════ #
-# Fixtures                                                                    #
-# ═══════════════════════════════════════════════════════════════════════════ #
-
-@pytest.fixture
-def cfg():
-    return _make_config()
+def _parsed(tmp_path: Path, **kwargs) -> MutationManager:
+    return _loaded(tmp_path, **kwargs).parse_to_ast()
 
 
-@pytest.fixture
-def manager(cfg):
-    return MutationManager(configLoader=cfg)
-
-
-@pytest.fixture
-def parsed_manager(manager):
-    manager.parseToAST(SRC_ONE_ADD)
-    return manager
-
-
-@pytest.fixture
-def manager_two_adds(cfg):
-    m = MutationManager(configLoader=cfg)
-    m.parseToAST(SRC_TWO_ADDS)
+def _mock_mutant(mutant_id: int = 1) -> MagicMock:
+    m = MagicMock()
+    m.id = mutant_id
     return m
 
 
-@pytest.fixture
-def manager_three_adds(cfg):
-    m = MutationManager(configLoader=cfg)
-    m.parseToAST(SRC_THREE_ADDS)
-    return m
+def _mock_result(mutant_id: int = 1) -> MagicMock:
+    r = MagicMock()
+    r.mutant = mutant_id
+    return r
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
-# Construction / __post_init__                                                #
+# __post_init__                                                               #
 # ═══════════════════════════════════════════════════════════════════════════ #
 
-class TestConstruction:
+class TestPostInit:
 
-    def test_valid_construction(self, cfg):
-        m = MutationManager(configLoader=cfg)
-        assert m.configLoader is cfg
-        assert m.mutateList == []
+    def test_valid_path_string_accepted(self, tmp_path):
+        cfg = _write_config(tmp_path)
+        _write_program(tmp_path)
+        _write_tests(tmp_path)
+        m = MutationManager(str(cfg))
+        assert m.config_path == str(cfg)
 
-    def test_custom_mutate_list_accepted(self, cfg):
-        existing = [Mutant("AOR", 0, "x = 1 - 2")]
-        m = MutationManager(configLoader=cfg, mutateList=existing)
-        assert m.mutateList is existing
+    def test_empty_string_raises(self):
+        with pytest.raises(ValueError, match="config_path must be a non-empty string"):
+            MutationManager("")
 
-    # --- configLoader: missing attributes ------------------------------------
+    def test_whitespace_only_raises(self):
+        with pytest.raises(ValueError, match="config_path must be a non-empty string"):
+            MutationManager("   ")
 
-    def test_missing_program_source_raises_type_error(self):
-        cfg = MagicMock(spec=["workspace_path", "operatorsList"])
-        with pytest.raises(TypeError, match="missing attribute 'program_source'"):
-            MutationManager(configLoader=cfg)
+    def test_non_string_raises(self):
+        with pytest.raises(ValueError, match="config_path must be a non-empty string"):
+            MutationManager(42)
 
-    def test_missing_workspace_path_raises_type_error(self):
-        cfg = MagicMock(spec=["program_source", "operatorsList"])
-        with pytest.raises(TypeError, match="missing attribute 'workspace_path'"):
-            MutationManager(configLoader=cfg)
+    def test_initial_state_is_clean(self, tmp_path):
+        cfg = _write_config(tmp_path)
+        _write_program(tmp_path)
+        _write_tests(tmp_path)
+        m = MutationManager(str(cfg))
+        assert m.config        is None
+        assert m.code_original == ""
+        assert m.code_ast      is None
+        assert m.mutant_list   == []
+        assert m.result_list   == []
 
-    def test_missing_operators_list_raises_type_error(self):
-        cfg = MagicMock(spec=["program_source", "workspace_path"])
-        with pytest.raises(TypeError, match="missing attribute 'operatorsList'"):
-            MutationManager(configLoader=cfg)
 
-    # --- configLoader: not loaded --------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════ #
+# load()                                                                      #
+# ═══════════════════════════════════════════════════════════════════════════ #
 
-    def test_unloaded_config_loader_raises_runtime_error(self):
-        cfg = MagicMock()
-        cfg.workspace_path = "/tmp"
-        cfg.operatorsList  = ["AOR"]
-        type(cfg).program_source = PropertyMock(
-            side_effect=RuntimeError("Call .load() first.")
+class TestLoad:
+
+    def test_config_file_not_found_raises(self, tmp_path):
+        m = MutationManager(str(tmp_path / "ghost.txt"))
+        with pytest.raises(FileNotFoundError, match="Config file not found"):
+            m.load()
+
+    def test_config_path_is_directory_raises(self, tmp_path):
+        m = MutationManager(str(tmp_path))
+        with pytest.raises(ValueError, match="config_path must point to a file"):
+            m.load()
+
+    def test_missing_program_path_key_raises(self, tmp_path):
+        _write_tests(tmp_path)
+        cfg = tmp_path / "config.txt"
+        cfg.write_text(
+            f"tests_path     = {tmp_path / 'test_suite.py'}\n"
+            f"operators_list = NFTP\n"
         )
-        with pytest.raises(RuntimeError, match="has not been loaded yet"):
-            MutationManager(configLoader=cfg)
+        with pytest.raises(ValueError, match="Missing required config keys"):
+            MutationManager(str(cfg)).load()
 
-    # --- mutateList: wrong type ----------------------------------------------
+    def test_missing_tests_path_key_raises(self, tmp_path):
+        _write_program(tmp_path)
+        cfg = tmp_path / "config.txt"
+        cfg.write_text(
+            f"program_path   = {tmp_path / 'spark_job.py'}\n"
+            f"operators_list = NFTP\n"
+        )
+        with pytest.raises(ValueError, match="Missing required config keys"):
+            MutationManager(str(cfg)).load()
 
-    def test_mutate_list_string_raises_type_error(self, cfg):
-        with pytest.raises(TypeError, match="mutateList must be a list"):
-            MutationManager(configLoader=cfg, mutateList="bad")
+    def test_missing_operators_list_key_raises(self, tmp_path):
+        _write_program(tmp_path)
+        _write_tests(tmp_path)
+        cfg = tmp_path / "config.txt"
+        cfg.write_text(
+            f"program_path = {tmp_path / 'spark_job.py'}\n"
+            f"tests_path   = {tmp_path / 'test_suite.py'}\n"
+        )
+        with pytest.raises(ValueError, match="Missing required config keys"):
+            MutationManager(str(cfg)).load()
 
-    def test_mutate_list_tuple_raises_type_error(self, cfg):
-        with pytest.raises(TypeError, match="mutateList must be a list"):
-            MutationManager(configLoader=cfg, mutateList=())
+    def test_program_file_not_found_raises(self, tmp_path):
+        _write_tests(tmp_path)
+        cfg = _write_config(tmp_path,
+                            program_path=str(tmp_path / "missing.py"))
+        with pytest.raises(FileNotFoundError, match="PySpark program not found"):
+            MutationManager(str(cfg)).load()
 
-    def test_mutate_list_none_raises_type_error(self, cfg):
-        with pytest.raises(TypeError, match="mutateList must be a list"):
-            MutationManager(configLoader=cfg, mutateList=None)
+    def test_empty_program_file_raises(self, tmp_path):
+        (tmp_path / "spark_job.py").write_text("   \n", encoding="utf-8")
+        _write_tests(tmp_path)
+        cfg = _write_config(tmp_path)
+        with pytest.raises(ValueError, match="Program file is empty"):
+            MutationManager(str(cfg)).load()
+
+    def test_success_populates_config(self, tmp_path):
+        m = _loaded(tmp_path)
+        assert isinstance(m.config, ConfigLoader)
+
+    def test_success_populates_code_original(self, tmp_path):
+        m = _loaded(tmp_path)
+        assert m.code_original == VALID_PROGRAM
+
+    def test_operators_normalised_to_uppercase(self, tmp_path):
+        m = _loaded(tmp_path, operators="nftp")
+        assert m.config.operators_list == ["NFTP"]
+
+    def test_multiple_operators_parsed(self, tmp_path):
+        _write_program(tmp_path)
+        _write_tests(tmp_path)
+        cfg = _write_config(tmp_path, operators="NFTP, AOR, ROR")
+        m   = MutationManager(str(cfg)).load()
+        assert m.config.operators_list == ["NFTP", "AOR", "ROR"]
+
+    def test_returns_self_for_chaining(self, tmp_path):
+        m = _make_manager(tmp_path)
+        assert m.load() is m
+
+    def test_blank_lines_in_config_ignored(self, tmp_path):
+        _write_program(tmp_path)
+        _write_tests(tmp_path)
+        cfg = _write_config(tmp_path, extra_lines="\n\n")
+        assert MutationManager(str(cfg)).load().config is not None
+
+    def test_comment_lines_in_config_ignored(self, tmp_path):
+        _write_program(tmp_path)
+        _write_tests(tmp_path)
+        cfg = _write_config(tmp_path, extra_lines="# comment\n")
+        assert MutationManager(str(cfg)).load().config is not None
+
+    def test_value_with_equals_sign_parsed(self, tmp_path):
+        _write_program(tmp_path)
+        _write_tests(tmp_path)
+        cfg = tmp_path / "config.txt"
+        cfg.write_text(
+            f"program_path   = {tmp_path / 'spark_job.py'}\n"
+            f"tests_path     = {tmp_path / 'test_suite.py'}\n"
+            f"operators_list = NFTP\n"
+            f"extra_key      = a=b=c\n"
+        )
+        m = MutationManager(str(cfg)).load()
+        assert m.config is not None
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
-# parseToAST()                                                                #
+# parse_to_ast()                                                              #
 # ═══════════════════════════════════════════════════════════════════════════ #
 
-class TestParseToAST:
+class TestParseToAst:
 
-    # --- TypeError -----------------------------------------------------------
+    def test_raises_before_load(self, tmp_path):
+        m = _make_manager(tmp_path)
+        with pytest.raises(RuntimeError, match="Call load\\(\\) first"):
+            m.parse_to_ast()
 
-    def test_none_raises_type_error(self, manager):
-        with pytest.raises(TypeError, match="source must be a non-empty string"):
-            manager.parseToAST(None)
+    def test_syntax_error_raises_value_error(self, tmp_path):
+        m = _loaded(tmp_path, program_content=SYNTAX_ERROR_PROGRAM)
+        with pytest.raises(ValueError, match="Syntax error at line"):
+            m.parse_to_ast()
 
-    def test_integer_raises_type_error(self, manager):
-        with pytest.raises(TypeError, match="source must be a non-empty string"):
-            manager.parseToAST(42)
+    def test_success_stores_ast(self, tmp_path):
+        m = _parsed(tmp_path)
+        assert isinstance(m.code_ast, ast.AST)
 
-    def test_empty_string_raises_type_error(self, manager):
-        with pytest.raises(TypeError, match="source must be a non-empty string"):
-            manager.parseToAST("")
-
-    def test_whitespace_only_raises_type_error(self, manager):
-        with pytest.raises(TypeError, match="source must be a non-empty string"):
-            manager.parseToAST("   \n\t")
-
-    # --- ValueError ----------------------------------------------------------
-
-    def test_syntax_error_raises_value_error(self, manager):
-        with pytest.raises(ValueError, match="Syntax error in source"):
-            manager.parseToAST(SRC_SYNTAX_ERROR)
-
-    # --- Success -------------------------------------------------------------
-
-    def test_returns_ast_module(self, manager):
-        result = manager.parseToAST(SRC_ONE_ADD)
-        assert isinstance(result, ast.AST)
-
-    def test_stores_program_source(self, manager):
-        manager.parseToAST(SRC_ONE_ADD)
-        assert manager._program_source == SRC_ONE_ADD
-
-    def test_stores_program_ast(self, manager):
-        manager.parseToAST(SRC_ONE_ADD)
-        assert manager._program_ast is not None
-
-    def test_returned_tree_is_stored_tree(self, manager):
-        result = manager.parseToAST(SRC_ONE_ADD)
-        assert result is manager._program_ast
-
-    def test_fix_missing_locations_applied(self, manager):
-        manager.parseToAST(SRC_ONE_ADD)
-        for node in ast.walk(manager._program_ast):
+    def test_fix_missing_locations_applied(self, tmp_path):
+        m = _parsed(tmp_path)
+        for node in ast.walk(m.code_ast):
             if hasattr(node, "lineno"):
                 assert node.lineno is not None
 
-    # --- Second call behaviour -----------------------------------------------
+    def test_returns_self_for_chaining(self, tmp_path):
+        m = _loaded(tmp_path)
+        assert m.parse_to_ast() is m
 
-    def test_second_call_clears_mutate_list(self, manager):
-        manager.parseToAST(SRC_ONE_ADD)
-        adds = _add_nodes_from(manager)
-        op   = _make_operator(registers=adds)
-        manager.applyMutation(op)
-        assert len(manager.mutateList) > 0
-
-        manager.parseToAST(SRC_ONE_ADD)
-        assert manager.mutateList == []
-
-    def test_second_call_with_empty_list_does_not_raise(self, manager):
-        """The 'if self.mutateList' branch must be skipped gracefully."""
-        manager.parseToAST(SRC_ONE_ADD)
-        assert manager.mutateList == []
-        manager.parseToAST(SRC_NO_ADD)   # must not raise
+    def test_ast_unparseable_reflects_source(self, tmp_path):
+        m = _parsed(tmp_path)
+        assert ast.unparse(m.code_ast) != ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
-# applyMutation()                                                             #
+# apply_mutation()                                                            #
 # ═══════════════════════════════════════════════════════════════════════════ #
 
 class TestApplyMutation:
 
-    # --- RuntimeError before parseToAST --------------------------------------
+    def test_raises_before_parse_to_ast(self, tmp_path):
+        m = _loaded(tmp_path)
+        with pytest.raises(RuntimeError, match="Call parse_to_ast\\(\\) first"):
+            m.apply_mutation()
 
-    def test_raises_before_parse(self, manager):
-        op = _make_operator()
-        with pytest.raises(RuntimeError, match="AST is not available"):
-            manager.applyMutation(op)
+    def test_unregistered_operator_skipped(self, tmp_path):
+        _write_program(tmp_path)
+        _write_tests(tmp_path)
+        cfg = _write_config(tmp_path, operators="UNKNOWN_OP")
+        m   = MutationManager(str(cfg)).load().parse_to_ast()
+        m.apply_mutation()
+        assert m.mutant_list == []
 
-    # --- TypeError: missing operator attributes ------------------------------
+    def test_import_error_skipped(self, tmp_path):
+        m = _parsed(tmp_path)
+        with patch.dict(_OPERATOR_REGISTRY, {"NFTP": "bad.module.Op"}):
+            with patch("src.mutation_manager.importlib.import_module",
+                       side_effect=ImportError("no module")):
+                m.apply_mutation()
+        assert m.mutant_list == []
 
-    def test_missing_name_raises_type_error(self, parsed_manager):
-        op = MagicMock(spec=["registers", "analyseAST", "buildMutate"])
-        op.registers = []
-        with pytest.raises(TypeError, match="missing attribute / method 'name'"):
-            parsed_manager.applyMutation(op)
+    def test_attribute_error_skipped(self, tmp_path):
+        m           = _parsed(tmp_path)
+        fake_module = MagicMock(spec=[])           # has no attributes
+        with patch.dict(_OPERATOR_REGISTRY, {"NFTP": "src.op.OpClass"}):
+            with patch("src.mutation_manager.importlib.import_module",
+                       return_value=fake_module):
+                m.apply_mutation()
+        assert m.mutant_list == []
 
-    def test_missing_registers_raises_type_error(self, parsed_manager):
-        op = MagicMock(spec=["name", "analyseAST", "buildMutate"])
-        op.name = "AOR"
-        with pytest.raises(TypeError, match="missing attribute / method 'registers'"):
-            parsed_manager.applyMutation(op)
+    def test_operator_with_no_nodes_skipped(self, tmp_path):
+        m       = _parsed(tmp_path)
+        mock_op = MagicMock()
+        mock_op.analyse_ast.return_value = []
 
-    def test_missing_analyse_ast_raises_type_error(self, parsed_manager):
-        op = MagicMock(spec=["name", "registers", "buildMutate"])
-        op.name      = "AOR"
-        op.registers = []
-        with pytest.raises(TypeError, match="missing attribute / method 'analyseAST'"):
-            parsed_manager.applyMutation(op)
+        with patch.object(m, "_resolve_operator", return_value=mock_op):
+            m.apply_mutation()
 
-    def test_missing_build_mutate_raises_type_error(self, parsed_manager):
-        op = MagicMock(spec=["name", "registers", "analyseAST"])
-        op.name      = "AOR"
-        op.registers = []
-        with pytest.raises(TypeError, match="missing attribute / method 'buildMutate'"):
-            parsed_manager.applyMutation(op)
+        mock_op.build_mutant.assert_not_called()
+        assert m.mutant_list == []
 
-    # --- TypeError: bad operator.name ----------------------------------------
+    def test_operator_exception_skipped(self, tmp_path):
+        m       = _parsed(tmp_path)
+        mock_op = MagicMock()
+        mock_op.analyse_ast.side_effect = RuntimeError("unexpected")
 
-    def test_empty_operator_name_raises_type_error(self, parsed_manager):
-        op = _make_operator(name="")
-        with pytest.raises(TypeError, match="operator.name must be a non-empty string"):
-            parsed_manager.applyMutation(op)
+        with patch.object(m, "_resolve_operator", return_value=mock_op):
+            m.apply_mutation()
 
-    def test_whitespace_operator_name_raises_type_error(self, parsed_manager):
-        op = _make_operator(name="  ")
-        with pytest.raises(TypeError, match="operator.name must be a non-empty string"):
-            parsed_manager.applyMutation(op)
+        assert m.mutant_list == []
 
-    def test_non_string_operator_name_raises_type_error(self, parsed_manager):
-        op = _make_operator()
-        op.name = 123
-        with pytest.raises(TypeError, match="operator.name must be a non-empty string"):
-            parsed_manager.applyMutation(op)
+    def test_mutants_accumulated_from_one_operator(self, tmp_path):
+        m       = _parsed(tmp_path)
+        mut_a   = _mock_mutant(1)
+        mut_b   = _mock_mutant(2)
+        mock_op = MagicMock()
+        mock_op.analyse_ast.return_value  = [MagicMock()]
+        mock_op.build_mutant.return_value = [mut_a, mut_b]
 
-    # --- TypeError: bad operator.registers -----------------------------------
+        with patch.object(m, "_resolve_operator", return_value=mock_op):
+            m.apply_mutation()
 
-    def test_registers_not_a_list_raises_type_error(self, parsed_manager):
-        op = _make_operator()
-        op.registers = "not-a-list"
-        with pytest.raises(TypeError, match="operator.registers must be a list"):
-            parsed_manager.applyMutation(op)
+        assert len(m.mutant_list) == 2
+        assert mut_a in m.mutant_list
+        assert mut_b in m.mutant_list
 
-    # --- Empty registers → returns [] ----------------------------------------
+    def test_mutants_accumulated_across_two_operators(self, tmp_path):
+        _write_program(tmp_path)
+        _write_tests(tmp_path)
+        cfg = _write_config(tmp_path, operators="NFTP, AOR")
+        m   = MutationManager(str(cfg)).load().parse_to_ast()
 
-    def test_empty_registers_returns_empty_list(self, parsed_manager):
-        op = _make_operator(registers=[])
-        result = parsed_manager.applyMutation(op)
-        assert result == []
+        ops = []
+        for i in range(2):
+            op = MagicMock()
+            op.analyse_ast.return_value  = [MagicMock()]
+            op.build_mutant.return_value = [_mock_mutant(i + 1)]
+            ops.append(op)
 
-    def test_empty_registers_does_not_add_to_mutate_list(self, parsed_manager):
-        op = _make_operator(registers=[])
-        parsed_manager.applyMutation(op)
-        assert parsed_manager.mutateList == []
+        with patch.object(m, "_resolve_operator", side_effect=ops):
+            m.apply_mutation()
 
-    # --- Single node → 1 mutant ----------------------------------------------
+        assert len(m.mutant_list) == 2
 
-    def test_single_node_returns_one_mutant(self, parsed_manager):
-        adds = _add_nodes_from(parsed_manager)
-        op   = _make_operator(registers=adds)
-        result = parsed_manager.applyMutation(op)
-        assert len(result) == 1
+    def test_returns_self_for_chaining(self, tmp_path):
+        m       = _parsed(tmp_path)
+        mock_op = MagicMock()
+        mock_op.analyse_ast.return_value = []
 
-    def test_single_node_mutant_type(self, parsed_manager):
-        adds = _add_nodes_from(parsed_manager)
-        op   = _make_operator(registers=adds)
-        result = parsed_manager.applyMutation(op)
-        assert isinstance(result[0], Mutant)
+        with patch.object(m, "_resolve_operator", return_value=mock_op):
+            result = m.apply_mutation()
 
-    def test_single_node_operator_name_stored(self, parsed_manager):
-        adds = _add_nodes_from(parsed_manager)
-        op   = _make_operator(name="AOR", registers=adds)
-        result = parsed_manager.applyMutation(op)
-        assert result[0].operator_name == "AOR"
+        assert result is m
 
-    def test_single_node_occurrence_index_is_zero(self, parsed_manager):
-        adds = _add_nodes_from(parsed_manager)
-        op   = _make_operator(registers=adds)
-        result = parsed_manager.applyMutation(op)
-        assert result[0].occurrence_index == 0
+    def test_mutant_dir_created(self, tmp_path):
+        m       = _parsed(tmp_path)
+        mock_op = MagicMock()
+        mock_op.analyse_ast.return_value = []
 
-    def test_single_node_source_code_is_valid_python(self, parsed_manager):
-        adds = _add_nodes_from(parsed_manager)
-        op   = _make_operator(registers=adds)
-        result = parsed_manager.applyMutation(op)
-        ast.parse(result[0].source_code)
+        with patch.object(m, "_resolve_operator", return_value=mock_op):
+            m.apply_mutation()
 
-    def test_single_node_mutation_reflected_in_source(self, parsed_manager):
-        adds = _add_nodes_from(parsed_manager)
-        op   = _make_operator(registers=adds, replacement=ast.Sub())
-        result = parsed_manager.applyMutation(op)
-        assert "-" in result[0].source_code
+        assert (tmp_path / "mutants").is_dir()
 
-    def test_single_node_added_to_mutate_list(self, parsed_manager):
-        adds = _add_nodes_from(parsed_manager)
-        op   = _make_operator(registers=adds)
-        result = parsed_manager.applyMutation(op)
-        assert parsed_manager.mutateList == result
+    def test_build_mutant_receives_correct_args(self, tmp_path):
+        m       = _parsed(tmp_path)
+        node    = MagicMock()
+        mock_op = MagicMock()
+        mock_op.analyse_ast.return_value  = [node]
+        mock_op.build_mutant.return_value = []
 
-    def test_build_mutate_called_once_per_node(self, parsed_manager):
-        adds = _add_nodes_from(parsed_manager)
-        op   = _make_operator(registers=adds)
-        parsed_manager.applyMutation(op)
-        assert op.buildMutate.call_count == len(adds)
+        with patch.object(m, "_resolve_operator", return_value=mock_op):
+            m.apply_mutation()
 
-    # --- Multiple nodes → N mutants ------------------------------------------
-
-    def test_two_nodes_return_two_mutants(self, manager_two_adds):
-        adds = _add_nodes_from(manager_two_adds)
-        op   = _make_operator(registers=adds)
-        result = manager_two_adds.applyMutation(op)
-        assert len(result) == 2
-
-    def test_three_nodes_return_three_mutants(self, manager_three_adds):
-        adds = _add_nodes_from(manager_three_adds)
-        op   = _make_operator(registers=adds)
-        result = manager_three_adds.applyMutation(op)
-        assert len(result) == 3
-
-    def test_occurrence_indices_are_sequential(self, manager_two_adds):
-        adds = _add_nodes_from(manager_two_adds)
-        op   = _make_operator(registers=adds)
-        result = manager_two_adds.applyMutation(op)
-        assert [m.occurrence_index for m in result] == [0, 1]
-
-    def test_each_mutant_source_is_valid_python(self, manager_three_adds):
-        adds = _add_nodes_from(manager_three_adds)
-        op   = _make_operator(registers=adds)
-        for mutant in manager_three_adds.applyMutation(op):
-            ast.parse(mutant.source_code)
-
-    def test_each_mutant_has_exactly_one_substitution(self, manager_two_adds):
-        """Only the targeted occurrence is replaced; remaining Adds stay."""
-        adds = _add_nodes_from(manager_two_adds)
-        op   = _make_operator(registers=adds, replacement=ast.Sub())
-        mutants = manager_two_adds.applyMutation(op)
-
-        for mutant in mutants:
-            tree = ast.parse(mutant.source_code)
-            subs           = sum(1 for n in ast.walk(tree) if isinstance(n, ast.Sub))
-            remaining_adds = sum(1 for n in ast.walk(tree) if isinstance(n, ast.Add))
-            assert subs == 1
-            assert remaining_adds == len(adds) - 1
-
-    # --- Original AST unmodified ---------------------------------------------
-
-    def test_original_ast_not_modified(self, manager_two_adds):
-        original_src = ast.unparse(manager_two_adds._program_ast)
-        adds = _add_nodes_from(manager_two_adds)
-        op   = _make_operator(registers=adds)
-        manager_two_adds.applyMutation(op)
-        assert ast.unparse(manager_two_adds._program_ast) == original_src
-
-    # --- Node-not-found branch (skip) ----------------------------------------
-
-    def test_foreign_node_is_skipped(self, parsed_manager):
-        """
-        A node that is not part of the manager's AST cannot be found in
-        ast.walk → applyMutation must skip it without raising.
-        """
-        foreign_node = ast.Add()
-        op = _make_operator(registers=[foreign_node])
-        result = parsed_manager.applyMutation(op)
-        assert result == []
-        assert parsed_manager.mutateList == []
-
-    # --- Accumulation across multiple operators ------------------------------
-
-    def test_two_operators_accumulate_in_mutate_list(self, manager_three_adds):
-        adds   = _add_nodes_from(manager_three_adds)
-        op_aor = _make_operator(name="AOR", registers=adds, replacement=ast.Sub())
-        op_ror = _make_operator(name="ROR", registers=adds, replacement=ast.Mult())
-
-        manager_three_adds.applyMutation(op_aor)
-        manager_three_adds.applyMutation(op_ror)
-
-        assert len(manager_three_adds.mutateList) == 6
-
-    def test_operator_names_preserved_in_mutate_list(self, manager_three_adds):
-        adds   = _add_nodes_from(manager_three_adds)
-        op_aor = _make_operator(name="AOR", registers=adds)
-        op_ror = _make_operator(name="ROR", registers=adds)
-
-        manager_three_adds.applyMutation(op_aor)
-        manager_three_adds.applyMutation(op_ror)
-
-        names = [m.operator_name for m in manager_three_adds.mutateList]
-        assert names.count("AOR") == 3
-        assert names.count("ROR") == 3
-
-    def test_reparse_resets_mutate_list_between_operators(self, cfg):
-        m = MutationManager(configLoader=cfg)
-        m.parseToAST(SRC_ONE_ADD)
-
-        op = _make_operator(registers=_add_nodes_from(m))
-        m.applyMutation(op)
-        assert len(m.mutateList) == 1
-
-        m.parseToAST(SRC_THREE_ADDS)
-        assert m.mutateList == []
-
-        op2 = _make_operator(registers=_add_nodes_from(m))
-        m.applyMutation(op2)
-        assert len(m.mutateList) == 3
+        call_kwargs = mock_op.build_mutant.call_args[1]
+        assert call_kwargs["nodes"]         == [node]
+        assert call_kwargs["original_ast"]  is m.code_ast
+        assert call_kwargs["original_path"] == m.config.program_path
+        assert "mutants" in call_kwargs["mutant_dir"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
-# Properties                                                                  #
+# run_tests()                                                                 #
 # ═══════════════════════════════════════════════════════════════════════════ #
 
-class TestProperties:
+class TestRunTests:
 
-    def test_program_ast_raises_before_parse(self, manager):
-        with pytest.raises(RuntimeError, match="AST is not available"):
-            _ = manager.program_ast
+    def _with_mutants(self, tmp_path: Path) -> MutationManager:
+        m = _parsed(tmp_path)
+        m.mutant_list = [_mock_mutant(1)]
+        return m
 
-    def test_program_source_raises_before_parse(self, manager):
-        with pytest.raises(RuntimeError, match="AST is not available"):
-            _ = manager.program_source
+    def test_raises_before_apply_mutation(self, tmp_path):
+        m = _parsed(tmp_path)
+        with pytest.raises(RuntimeError, match="Call apply_mutation\\(\\) first"):
+            m.run_tests()
 
-    def test_program_ast_after_parse(self, parsed_manager):
-        assert isinstance(parsed_manager.program_ast, ast.AST)
+    def test_test_runner_instantiated_with_correct_args(self, tmp_path):
+        m           = self._with_mutants(tmp_path)
+        mock_runner = MagicMock()
+        mock_runner.run_test.return_value = [_mock_result()]
 
-    def test_program_source_after_parse(self, parsed_manager):
-        assert parsed_manager.program_source == SRC_ONE_ADD
+        with patch("src.mutation_manager.TestRunner",
+                   return_value=mock_runner) as mock_cls:
+            m.run_tests()
 
-    def test_program_ast_is_internal_object(self, parsed_manager):
-        assert parsed_manager.program_ast is parsed_manager._program_ast
+        mock_cls.assert_called_once_with(
+            mutant_list=m.mutant_list,
+            config=m.config,
+        )
 
-    def test_program_source_is_internal_object(self, parsed_manager):
-        assert parsed_manager.program_source is parsed_manager._program_source
+    def test_run_test_method_called(self, tmp_path):
+        m           = self._with_mutants(tmp_path)
+        mock_runner = MagicMock()
+        mock_runner.run_test.return_value = [_mock_result()]
 
+        with patch("src.mutation_manager.TestRunner", return_value=mock_runner):
+            m.run_tests()
 
-# ═══════════════════════════════════════════════════════════════════════════ #
-# _assert_ast_ready()                                                         #
-# ═══════════════════════════════════════════════════════════════════════════ #
+        mock_runner.run_test.assert_called_once()
 
-class TestAssertAstReady:
+    def test_result_list_populated(self, tmp_path):
+        m           = self._with_mutants(tmp_path)
+        results     = [_mock_result(1), _mock_result(2)]
+        mock_runner = MagicMock()
+        mock_runner.run_test.return_value = results
 
-    def test_raises_before_parse(self, manager):
-        with pytest.raises(RuntimeError, match="AST is not available"):
-            manager._assert_ast_ready()
+        with patch("src.mutation_manager.TestRunner", return_value=mock_runner):
+            m.run_tests()
 
-    def test_does_not_raise_after_parse(self, parsed_manager):
-        parsed_manager._assert_ast_ready()
+        assert m.result_list == results
 
+    def test_returns_self_for_chaining(self, tmp_path):
+        m           = self._with_mutants(tmp_path)
+        mock_runner = MagicMock()
+        mock_runner.run_test.return_value = [_mock_result()]
 
-# ═══════════════════════════════════════════════════════════════════════════ #
-# _NodeReplacer                                                               #
-# ═══════════════════════════════════════════════════════════════════════════ #
+        with patch("src.mutation_manager.TestRunner", return_value=mock_runner):
+            result = m.run_tests()
 
-class TestNodeReplacer:
-
-    def _tree(self, src: str) -> ast.AST:
-        t = ast.parse(src)
-        ast.fix_missing_locations(t)
-        return t
-
-    def test_replaces_target_node_by_identity(self):
-        tree = self._tree("x = 1 + 2")
-        add  = next(n for n in ast.walk(tree) if isinstance(n, ast.Add))
-        new_tree = _NodeReplacer(add, ast.Sub()).visit(copy.deepcopy(tree))
-        assert sum(1 for n in ast.walk(new_tree) if isinstance(n, ast.Sub)) == 1
-
-    def test_non_target_nodes_untouched(self):
-        tree = self._tree("x = 1 * 2 + 3")
-        add  = next(n for n in ast.walk(tree) if isinstance(n, ast.Add))
-        new_tree = _NodeReplacer(add, ast.Sub()).visit(copy.deepcopy(tree))
-        assert sum(1 for n in ast.walk(new_tree) if isinstance(n, ast.Mult)) == 1
-
-    def test_only_matching_identity_replaced(self):
-        tree = self._tree("x = 1 + 2 + 3")
-        adds = [n for n in ast.walk(tree) if isinstance(n, ast.Add)]
-        new_tree = _NodeReplacer(adds[0], ast.Sub()).visit(copy.deepcopy(tree))
-        assert sum(1 for n in ast.walk(new_tree) if isinstance(n, ast.Add)) == 1
-        assert sum(1 for n in ast.walk(new_tree) if isinstance(n, ast.Sub)) == 1
-
-    def test_replacement_node_is_deep_copied(self):
-        tree     = self._tree("x = 1 + 2")
-        add      = next(n for n in ast.walk(tree) if isinstance(n, ast.Add))
-        template = ast.Sub()
-        replacer = _NodeReplacer(add, template)
-        r1 = replacer.generic_visit(add)
-        r2 = replacer.generic_visit(add)
-        assert isinstance(r1, ast.Sub)
-        assert r1 is not template
-        assert r2 is not template
-
-    def test_unmatched_node_delegates_to_super(self):
-        tree  = self._tree("x = 1")
-        const = next(n for n in ast.walk(tree) if isinstance(n, ast.Constant))
-        replacer = _NodeReplacer(ast.Add(), ast.Sub())   # different target
-        result = replacer.generic_visit(const)
-        assert result is not None
+        assert result is m
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
-# Mutant                                                                      #
+# agregate_results()                                                          #
 # ═══════════════════════════════════════════════════════════════════════════ #
 
-class TestMutant:
+class TestAgregateResults:
 
-    def test_repr_contains_operator_name(self):
-        assert "AOR" in repr(Mutant("AOR", 0, "x = 1 - 2"))
+    def _with_results(self, tmp_path: Path) -> MutationManager:
+        m = _parsed(tmp_path)
+        m.mutant_list = [_mock_mutant(1)]
+        m.result_list = [_mock_result(1)]
+        return m
 
-    def test_repr_contains_occurrence_index(self):
-        assert "7" in repr(Mutant("AOR", 7, "x = 1 - 2"))
+    def test_raises_before_run_tests(self, tmp_path):
+        m = _parsed(tmp_path)
+        m.mutant_list = [_mock_mutant()]
+        with pytest.raises(RuntimeError, match="Call run_tests\\(\\) first"):
+            m.agregate_results()
 
-    def test_repr_contains_source_preview(self):
-        assert "x = 1 - 2" in repr(Mutant("AOR", 0, "x = 1 - 2"))
+    def test_reporter_instantiated_with_correct_args(self, tmp_path):
+        m             = self._with_results(tmp_path)
+        mock_reporter = MagicMock()
 
-    def test_repr_truncates_long_source(self):
-        long_src = "x = " + "+ ".join(["1"] * 50)
-        assert len(repr(Mutant("AOR", 0, long_src))) < len(long_src) + 60
+        with patch("src.mutation_manager.Reporter",
+                   return_value=mock_reporter) as mock_cls:
+            m.agregate_results()
 
-    def test_repr_escapes_newlines(self):
-        assert "\\n" in repr(Mutant("AOR", 0, "x = 1\ny = 2"))
+        mock_cls.assert_called_once_with(
+            result_list=m.result_list,
+            code_original=m.code_original,
+            mutant_list=m.mutant_list,
+        )
+
+    def test_reporter_methods_called_in_correct_order(self, tmp_path):
+        m             = self._with_results(tmp_path)
+        mock_reporter = MagicMock()
+        order         = []
+
+        mock_reporter.calculate.side_effect    = lambda: order.append("calculate")
+        mock_reporter.make_diff.side_effect    = lambda: order.append("make_diff")
+        mock_reporter.show_results.side_effect = lambda: order.append("show_results")
+
+        with patch("src.mutation_manager.Reporter", return_value=mock_reporter):
+            m.agregate_results()
+
+        assert order == ["calculate", "make_diff", "show_results"]
+
+    def test_returns_self_for_chaining(self, tmp_path):
+        m             = self._with_results(tmp_path)
+        mock_reporter = MagicMock()
+
+        with patch("src.mutation_manager.Reporter", return_value=mock_reporter):
+            result = m.agregate_results()
+
+        assert result is m
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
-# MutationManager.__repr__                                                    #
+# _resolve_operator()                                                         #
 # ═══════════════════════════════════════════════════════════════════════════ #
 
-class TestMutationManagerRepr:
+class TestResolveOperator:
 
-    def test_repr_before_parse(self, manager):
-        assert "ast_ready=False" in repr(manager)
+    def test_unknown_operator_raises_key_error(self, tmp_path):
+        m = _parsed(tmp_path)
+        with pytest.raises(KeyError, match="is not registered"):
+            m._resolve_operator("GHOST")
 
-    def test_repr_after_parse(self, parsed_manager):
-        assert "ast_ready=True" in repr(parsed_manager)
+    def test_import_error_propagated(self, tmp_path):
+        m = _parsed(tmp_path)
+        with patch.dict(_OPERATOR_REGISTRY, {"NFTP": "bad.module.Op"}):
+            with patch("src.mutation_manager.importlib.import_module",
+                       side_effect=ImportError("boom")):
+                with pytest.raises(ImportError):
+                    m._resolve_operator("NFTP")
 
-    def test_repr_zero_mutants(self, parsed_manager):
-        assert "mutants=0" in repr(parsed_manager)
+    def test_attribute_error_propagated(self, tmp_path):
+        m           = _parsed(tmp_path)
+        fake_module = MagicMock(spec=[])    # no attributes at all
+        with patch.dict(_OPERATOR_REGISTRY, {"NFTP": "src.op.OpClass"}):
+            with patch("src.mutation_manager.importlib.import_module",
+                       return_value=fake_module):
+                with pytest.raises(AttributeError):
+                    m._resolve_operator("NFTP")
 
-    def test_repr_mutant_count_after_mutation(self, parsed_manager):
-        op = _make_operator(registers=_add_nodes_from(parsed_manager))
-        parsed_manager.applyMutation(op)
-        assert "mutants=1" in repr(parsed_manager)
+    def test_success_returns_operator_instance(self, tmp_path):
+        m           = _parsed(tmp_path)
+        mock_op     = MagicMock()
+        mock_cls    = MagicMock(return_value=mock_op)
+        fake_module = MagicMock()
+        fake_module.OpClass = mock_cls
+
+        with patch.dict(_OPERATOR_REGISTRY, {"NFTP": "src.op.OpClass"}):
+            with patch("src.mutation_manager.importlib.import_module",
+                       return_value=fake_module):
+                result = m._resolve_operator("NFTP")
+
+        assert result is mock_op
+
+    def test_lowercase_name_normalised(self, tmp_path):
+        m           = _parsed(tmp_path)
+        mock_op     = MagicMock()
+        mock_cls    = MagicMock(return_value=mock_op)
+        fake_module = MagicMock()
+        fake_module.OpClass = mock_cls
+
+        with patch.dict(_OPERATOR_REGISTRY, {"NFTP": "src.op.OpClass"}):
+            with patch("src.mutation_manager.importlib.import_module",
+                       return_value=fake_module):
+                result = m._resolve_operator("nftp")
+
+        assert result is mock_op
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+# _ensure_mutant_dir()                                                        #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class TestEnsureMutantDir:
+
+    def test_creates_directory(self, tmp_path):
+        m = _parsed(tmp_path)
+        d = m._ensure_mutant_dir()
+        assert d.is_dir()
+
+    def test_returns_correct_path(self, tmp_path):
+        m = _parsed(tmp_path)
+        assert m._ensure_mutant_dir() == tmp_path / "mutants"
+
+    def test_idempotent_on_second_call(self, tmp_path):
+        m = _parsed(tmp_path)
+        m._ensure_mutant_dir()
+        m._ensure_mutant_dir()   # must not raise
+        assert (tmp_path / "mutants").is_dir()
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+# _parse_config_file()                                                        #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class TestParseConfigFile:
+
+    def test_basic_key_value(self):
+        result = MutationManager._parse_config_file("foo = bar\nbaz = qux\n")
+        assert result == {"foo": "bar", "baz": "qux"}
+
+    def test_blank_lines_ignored(self):
+        result = MutationManager._parse_config_file("\nfoo = bar\n\n")
+        assert result == {"foo": "bar"}
+
+    def test_comment_lines_ignored(self):
+        result = MutationManager._parse_config_file("# comment\nfoo = bar\n")
+        assert result == {"foo": "bar"}
+
+    def test_lines_without_equals_ignored(self):
+        result = MutationManager._parse_config_file("no_equals\nfoo = bar\n")
+        assert result == {"foo": "bar"}
+
+    def test_value_with_equals_preserved(self):
+        result = MutationManager._parse_config_file("key = a=b=c\n")
+        assert result == {"key": "a=b=c"}
+
+    def test_surrounding_whitespace_stripped(self):
+        result = MutationManager._parse_config_file("  key  =  value  \n")
+        assert result == {"key": "value"}
+
+    def test_empty_string_returns_empty_dict(self):
+        assert MutationManager._parse_config_file("") == {}
+
+    def test_only_comments_returns_empty_dict(self):
+        assert MutationManager._parse_config_file("# a\n# b\n") == {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+# Guards                                                                      #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class TestGuards:
+
+    # _assert_loaded ----------------------------------------------------------
+
+    def test_loaded_raises_when_config_none(self, tmp_path):
+        m = _make_manager(tmp_path)
+        with pytest.raises(RuntimeError, match="Call load\\(\\) first"):
+            m._assert_loaded()
+
+    def test_loaded_raises_when_source_empty(self, tmp_path):
+        m               = _make_manager(tmp_path)
+        m.config        = ConfigLoader(str(tmp_path / "spark_job.py"),
+                                       str(tmp_path / "test_suite.py"),
+                                       ["NFTP"])
+        m.code_original = ""
+        with pytest.raises(RuntimeError, match="Call load\\(\\) first"):
+            m._assert_loaded()
+
+    def test_loaded_passes_when_ready(self, tmp_path):
+        _loaded(tmp_path)._assert_loaded()
+
+    # _assert_ast_ready -------------------------------------------------------
+
+    def test_ast_ready_raises_when_none(self, tmp_path):
+        m = _loaded(tmp_path)
+        with pytest.raises(RuntimeError, match="Call parse_to_ast\\(\\) first"):
+            m._assert_ast_ready()
+
+    def test_ast_ready_passes_when_set(self, tmp_path):
+        _parsed(tmp_path)._assert_ast_ready()
+
+    # _assert_mutants_ready ---------------------------------------------------
+
+    def test_mutants_ready_raises_when_empty(self, tmp_path):
+        m = _parsed(tmp_path)
+        with pytest.raises(RuntimeError, match="Call apply_mutation\\(\\) first"):
+            m._assert_mutants_ready()
+
+    def test_mutants_ready_passes_when_populated(self, tmp_path):
+        m             = _parsed(tmp_path)
+        m.mutant_list = [_mock_mutant()]
+        m._assert_mutants_ready()
+
+    # _assert_results_ready ---------------------------------------------------
+
+    def test_results_ready_raises_when_empty(self, tmp_path):
+        m = _parsed(tmp_path)
+        with pytest.raises(RuntimeError, match="Call run_tests\\(\\) first"):
+            m._assert_results_ready()
+
+    def test_results_ready_passes_when_populated(self, tmp_path):
+        m             = _parsed(tmp_path)
+        m.result_list = [_mock_result()]
+        m._assert_results_ready()
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+# __repr__                                                                    #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class TestRepr:
+
+    def test_before_load(self, tmp_path):
+        m = _make_manager(tmp_path)
+        r = repr(m)
+        assert "config=not set" in r
+        assert "ast=not set"    in r
+        assert "mutants=0"      in r
+        assert "results=0"      in r
+
+    def test_after_load(self, tmp_path):
+        assert "config=set" in repr(_loaded(tmp_path))
+
+    def test_after_parse_to_ast(self, tmp_path):
+        assert "ast=set" in repr(_parsed(tmp_path))
+
+    def test_mutant_count(self, tmp_path):
+        m             = _parsed(tmp_path)
+        m.mutant_list = [_mock_mutant(i) for i in range(4)]
+        assert "mutants=4" in repr(m)
+
+    def test_result_count(self, tmp_path):
+        m             = _parsed(tmp_path)
+        m.result_list = [_mock_result(i) for i in range(3)]
+        assert "results=3" in repr(m)
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -629,44 +764,49 @@ class TestMutationManagerRepr:
 
 class TestIntegration:
 
-    def test_full_pipeline_single_occurrence(self, cfg):
-        m = MutationManager(configLoader=cfg)
-        m.parseToAST(SRC_ONE_ADD)
-        adds    = _add_nodes_from(m)
-        mutants = m.applyMutation(_make_operator(registers=adds, replacement=ast.Sub()))
+    def test_load_then_parse(self, tmp_path):
+        m = _parsed(tmp_path)
+        assert m.config        is not None
+        assert m.code_original == VALID_PROGRAM
+        assert isinstance(m.code_ast, ast.AST)
 
-        assert len(mutants) == 1
-        ast.parse(mutants[0].source_code)
-        assert "-" in mutants[0].source_code
+    def test_full_pipeline_with_mocks(self, tmp_path):
+        m = _parsed(tmp_path)
 
-    def test_full_pipeline_multiple_occurrences(self, cfg):
-        m = MutationManager(configLoader=cfg)
-        m.parseToAST(SRC_THREE_ADDS)
-        adds    = _add_nodes_from(m)
-        mutants = m.applyMutation(_make_operator(registers=adds, replacement=ast.Sub()))
+        mut_a   = _mock_mutant(1)
+        mut_b   = _mock_mutant(2)
+        mock_op = MagicMock()
+        mock_op.analyse_ast.return_value  = [MagicMock()]
+        mock_op.build_mutant.return_value = [mut_a, mut_b]
 
-        assert len(mutants) == 3
-        for mu in mutants:
-            ast.parse(mu.source_code)
+        results      = [_mock_result(1), _mock_result(2)]
+        mock_runner  = MagicMock()
+        mock_runner.run_test.return_value = results
+        mock_reporter = MagicMock()
 
-    def test_two_operators_no_cross_contamination(self, cfg):
-        m = MutationManager(configLoader=cfg)
-        m.parseToAST(SRC_THREE_ADDS)
-        adds = _add_nodes_from(m)
+        with patch.object(m, "_resolve_operator", return_value=mock_op), \
+             patch("src.mutation_manager.TestRunner", return_value=mock_runner), \
+             patch("src.mutation_manager.Reporter", return_value=mock_reporter):
 
-        aor = m.applyMutation(_make_operator(name="AOR", registers=adds, replacement=ast.Sub()))
-        ror = m.applyMutation(_make_operator(name="ROR", registers=adds, replacement=ast.Mult()))
+            result = (
+                m.apply_mutation()
+                 .run_tests()
+                 .agregate_results()
+            )
 
-        assert all(mu.operator_name == "AOR" for mu in aor)
-        assert all(mu.operator_name == "ROR" for mu in ror)
+        assert result is m
+        assert len(m.mutant_list) == 2
+        assert m.result_list      == results
+        mock_reporter.calculate.assert_called_once()
+        mock_reporter.make_diff.assert_called_once()
+        mock_reporter.show_results.assert_called_once()
 
-    def test_reparse_fully_resets_state(self, cfg):
-        m = MutationManager(configLoader=cfg)
-        m.parseToAST(SRC_ONE_ADD)
-        m.applyMutation(_make_operator(registers=_add_nodes_from(m)))
-        assert len(m.mutateList) == 1
+    def test_full_chain_returns_same_instance(self, tmp_path):
+        m       = _parsed(tmp_path)
+        mock_op = MagicMock()
+        mock_op.analyse_ast.return_value = []
 
-        m.parseToAST(SRC_THREE_ADDS)
-        assert m.mutateList == []
-        m.applyMutation(_make_operator(registers=_add_nodes_from(m)))
-        assert len(m.mutateList) == 3
+        with patch.object(m, "_resolve_operator", return_value=mock_op):
+            result = m.apply_mutation()
+
+        assert result is m
