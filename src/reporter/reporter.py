@@ -30,10 +30,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .test_result import TestResult
+from ..model.test_result import TestResult
 
 if TYPE_CHECKING:
-    from src.operator import Mutant
+    from src.operators.operator import Mutant
 
 logger = logging.getLogger(__name__)
 

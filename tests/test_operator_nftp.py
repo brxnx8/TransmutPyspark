@@ -31,8 +31,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock, call
 
-from src.operator_nftp import OperatorNFTP
-from src.mutant import Mutant
+from src.operators.operator_nftp import OperatorNFTP
+from src.model.mutant import Mutant
 
 
 # ─────────────────────────────────────────────────────────────────────────── #

@@ -37,11 +37,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from src.test_result import TestResult
-from src.config_loader import ConfigLoader
+from src.model.test_result import TestResult
+from src.model.config_loader import ConfigLoader
 
 if TYPE_CHECKING:
-    from src.operator import Mutant
+    from src.operators.operator import Mutant
 
 logger = logging.getLogger(__name__)
 

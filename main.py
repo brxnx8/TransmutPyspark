@@ -7,11 +7,4 @@ logging.basicConfig(
 )
 
 if __name__ == "__main__":
-    (
-        MutationManager("config.txt")
-        .load()
-        .parse_to_ast()
-        .apply_mutation()
-        .run_tests()
-        .agregate_results()
-    )
+    MutationManager("config.txt").run()

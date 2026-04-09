@@ -41,7 +41,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from src.mutant import Mutant
+from src.model.mutant import Mutant
 
 logger = logging.getLogger(__name__)
 

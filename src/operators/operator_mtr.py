@@ -70,8 +70,8 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from src.operator import Operator
-from src.mutant import Mutant
+from src.operators.operator import Operator
+from src.model.mutant import Mutant
 
 logger = logging.getLogger(__name__)
 
