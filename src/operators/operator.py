@@ -40,6 +40,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+import copy
 
 from src.model.mutant import Mutant
 
@@ -85,6 +86,20 @@ class Operator(ABC):
         self._validate_name()
         self._validate_mutant_registers()
         self._validate_mutant_list()
+
+    @classmethod
+    def create(cls) -> "Operator":
+        """
+        Factory sem argumentos usada pelo MutationManager._load_operator().
+        Cada subclasse define _DEFAULT_ID, _DEFAULT_NAME e
+        _DEFAULT_REGISTERS como atributos de classe.
+        """
+        return cls(
+            id=cls._DEFAULT_ID,
+            name=cls._DEFAULT_NAME,
+            mutant_registers=cls._DEFAULT_REGISTERS,
+        )
+
 
     # ------------------------------------------------------------------ #
     # Abstract interface — subclasses MUST implement both methods          #
@@ -180,6 +195,57 @@ class Operator(ABC):
         """
         self.mutant_list.clear()
         logger.info(f"[Operator:{self.name}] mutant_list cleared.")
+
+
+    def _replace_node(
+        self,
+        original_ast: ast.AST,
+        target: ast.AST,
+        replacement: ast.AST,
+    ) -> ast.AST:
+        """
+        Clona original_ast, substitui target por replacement e retorna
+        a árvore modificada. O target é localizado por posição (lineno +
+        col_offset + tipo) para sobreviver ao deepcopy.
+        """
+        # Fingerprint do nó alvo — sobrevive ao deepcopy
+        target_type    = type(target)
+        target_lineno  = getattr(target, "lineno",     None)
+        target_col     = getattr(target, "col_offset", None)
+        target_source  = ast.unparse(target)
+
+        _replacement = copy.deepcopy(replacement)
+
+        class _Replacer(ast.NodeTransformer):
+            def generic_visit(self, node: ast.AST) -> ast.AST:
+                if (
+                    type(node) is target_type
+                    and getattr(node, "lineno",     None) == target_lineno
+                    and getattr(node, "col_offset", None) == target_col
+                    and ast.unparse(node) == target_source
+                ):
+                    return _replacement
+                return super().generic_visit(node)
+
+        mutated = _Replacer().visit(copy.deepcopy(original_ast))
+        ast.fix_missing_locations(mutated)
+        return mutated
+
+    def _write_mutant_file(
+        self,
+        mutated_ast: ast.AST,
+        mutant_dir: str,
+        filename: str,
+    ) -> str:
+        """
+        Grava o mutante em mutant_dir/<OPERATOR_NAME>/filename.
+        Retorna o caminho absoluto do arquivo gerado.
+        """
+        source = ast.unparse(mutated_ast)
+        path = Path(mutant_dir) / self.name / filename  # ← subpasta por operador
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+        return str(path.resolve())
 
     # ------------------------------------------------------------------ #
     # Logging helpers — centralized log output for all operators           #

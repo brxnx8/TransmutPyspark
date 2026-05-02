@@ -53,7 +53,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.mutation_manager import MutationManager, _OPERATOR_REGISTRY
-from src.model.config_loader import ConfigLoader
+from src.config.config_loader import ConfigLoader
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #

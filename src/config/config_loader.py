@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+
 @dataclass
 class ConfigLoader:
     """
@@ -11,16 +12,19 @@ class ConfigLoader:
         program_path   : Path to the .py file of the PySpark application
         tests_path     : Path to the .py file containing pytest tests
         operators_list : List of mutation operator identifiers
+        workspace_dir  : Root directory where TransmutPysparkOutput will be created
     """
-    program_path: str
-    tests_path: str
+    program_path:  str
+    tests_path:    str
     operators_list: list[str]
+    workspace_dir: str
 
     def __repr__(self) -> str:
         return (
             f"ConfigLoader("
-            f"program_path={self.program_path}, "
+            f"program_path={self.program_path!r}, "
             f"tests_path={self.tests_path!r}, "
-            f"operators_list={self.operators_list!r} "
+            f"operators_list={self.operators_list!r}, "
+            f"workspace_dir={self.workspace_dir!r}"
             f")"
         )

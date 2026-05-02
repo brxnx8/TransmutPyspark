@@ -3,32 +3,10 @@ TestRunner
 ==========
 Responsible for executing the project's pytest suite against every mutant
 in ``mutant_list`` and collecting one ``TestResult`` per mutant.
-
-Execution strategy
-------------------
-Mutants are tested in parallel using ``ThreadPoolExecutor``. Each worker
-spawns an isolated ``pytest`` subprocess pointed at ``mutant.mutant_path``,
-so there is no shared state between concurrent runs.
-
-The degree of parallelism is capped by ``max_workers``
-(default: ``min(4, cpu_count)``) to avoid competing with the SparkSession
-that may be active in the same environment.
-
-Mutant status
--------------
-- **killed**   — at least one test failed (pytest exit code 1).
-- **survived** — all tests passed (pytest exit code 0).
-- **timeout**  — pytest did not finish within the time limit.
-- **error**    — pytest could not run at all (exit codes 2-5 or subprocess
-                 crash).
-
-Deliberately out of scope
---------------------------
-- Generating mutants        → Operator.build_mutant()
-- Aggregating / reporting   → Report (called by MutationManager)
 """
 
 import os
+import shutil
 import subprocess
 import time
 import logging
@@ -38,44 +16,22 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from src.model.test_result import TestResult
-from src.model.config_loader import ConfigLoader
+from src.config.config_loader import ConfigLoader
 
 if TYPE_CHECKING:
     from src.operators.operator import Mutant
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class TestRunner:
-    """
-    Executes the pytest suite against every mutant and returns the results.
-
-    Parameters
-    ----------
-    mutant_list : list[Mutant]
-        Mutants produced by ``Operator.build_mutant()``, received from
-        ``MutationManager``.  Each mutant already has its source written
-        to ``mutant.mutant_path``.
-    config      : ConfigLoader
-        Configuration dataclass providing ``tests_path`` (path to the
-        pytest file) and ``program_path`` (used to resolve the workspace).
-    max_workers : int
-        Maximum number of parallel pytest subprocesses.
-        Defaults to ``min(4, os.cpu_count() or 1)``.
-    results     : list[TestResult]
-        Populated by ``run_test()``.  Normally left empty on construction.
-    """
-
     mutant_list: list
     config:      ConfigLoader
-    max_workers: int               = field(
+    max_workers: int              = field(
         default_factory=lambda: min(4, os.cpu_count() or 1)
     )
-    results:     list[TestResult]  = field(default_factory=list)
-
-    # ------------------------------------------------------------------ #
-    # Post-init validation                                                 #
-    # ------------------------------------------------------------------ #
+    results:     list[TestResult] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._validate_mutant_list()
@@ -87,45 +43,29 @@ class TestRunner:
     # ------------------------------------------------------------------ #
 
     def run_test(self) -> list[TestResult]:
-        """
-        Execute the pytest suite against every mutant in ``mutant_list``
-        in parallel and return the collected ``TestResult`` instances.
-
-        For each mutant the runner:
-          1. Prepends the directory containing ``mutant.mutant_path`` to
-             ``PYTHONPATH`` so the test file imports the mutated module.
-          2. Runs ``pytest <tests_path> -x -q --tb=short`` in a subprocess.
-          3. Wraps the outcome in a ``TestResult`` and appends it to
-             ``self.results``.
-
-        Results are also stored in ``self.results`` so callers can inspect
-        them after the call.
-
-        Returns
-        -------
-        list[TestResult]
-            One ``TestResult`` per mutant, in completion order.
-
-        Raises
-        ------
-        RuntimeError
-            If ``mutant_list`` is empty.
-        """
         if not self.mutant_list:
             raise RuntimeError(
-                "[TestRunner] mutant_list is empty — nothing to test. "
-                "Ensure apply_mutation() ran before run_tests()."
+                "[TestRunner] mutant_list is empty — nothing to test."
             )
 
         self.results.clear()
+        logger.info(
+            f"[TestRunner.run_test] Starting: {len(self.mutant_list)} mutant(s), "
+            f"max_workers={self.max_workers}."
+        )
 
-        logger.info(f"[TestRunner.run_test] Starting: {len(self.mutant_list)} mutant(s), max_workers={self.max_workers}.")
+        # Diretório raiz para todos os sandboxes desta execução
+        # Fica dentro do workdir → TransmutPysparkOutput/sandboxes/
+        work_dir    = Path(self.config.workspace_dir) / "TransmutPysparkOutput"
+        sandbox_root = work_dir / "sandboxes"
+        sandbox_root.mkdir(parents=True, exist_ok=True)
 
         futures_map: dict = {}
-
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             for mutant in self.mutant_list:
-                future = executor.submit(self._run_single_mutant, mutant)
+                future = executor.submit(
+                    self._run_single_mutant, mutant, sandbox_root
+                )
                 futures_map[future] = mutant
 
             for future in as_completed(futures_map):
@@ -133,23 +73,25 @@ class TestRunner:
                 try:
                     result = future.result()
                 except Exception as exc:
-                    # Unexpected worker crash — record as error
                     result = TestResult(
                         mutant=mutant.id,
                         status="error",
                         failed_tests=[],
                         execution_time=0.0,
                     )
-                    logger.error(f"[TestRunner.run_test] Mutant {mutant.id} worker crashed: {exc} — recorded as error.")
+                    logger.error(
+                        f"[TestRunner.run_test] Mutant {mutant.id} worker crashed: "
+                        f"{exc} — recorded as error."
+                    )
                 self.results.append(result)
 
         killed   = sum(1 for r in self.results if r.status == "killed")
         survived = sum(1 for r in self.results if r.status == "survived")
         timeouts = sum(1 for r in self.results if r.status == "timeout")
         errors   = sum(1 for r in self.results if r.status == "error")
-
         logger.info(
-            f"[TestRunner.run_test] Done — killed={killed}, survived={survived}, timeout={timeouts}, error={errors}"
+            f"[TestRunner.run_test] Done — killed={killed}, survived={survived}, "
+            f"timeout={timeouts}, error={errors}"
         )
         return self.results
 
@@ -157,52 +99,34 @@ class TestRunner:
     # Private helpers                                                      #
     # ------------------------------------------------------------------ #
 
-    def _run_single_mutant(self, mutant: "Mutant") -> TestResult:
-        """
-        Run pytest against a single mutant file and return a ``TestResult``.
+    def _run_single_mutant(
+        self, mutant: "Mutant", sandbox_root: Path
+    ) -> TestResult:
+        mutant_path   = Path(mutant.mutant_path)
+        original_name = Path(mutant.original_path).name   # ex: uts.py
 
-        The mutant file already exists at ``mutant.mutant_path`` (written
-        by ``Operator.build_mutant``).  Its parent directory is prepended
-        to ``PYTHONPATH`` so that ``import <module>`` inside the test file
-        resolves to the mutated version.
+        # Sandbox isolado: TransmutPysparkOutput/sandboxes/sandbox_<id>/
+        sandbox_dir = sandbox_root / f"sandbox_{mutant.id}"
+        sandbox_dir.mkdir(exist_ok=True)
 
-        Parameters
-        ----------
-        mutant : Mutant
-            The mutant to test.
+        target = sandbox_dir / original_name
+        target.write_text(
+            mutant_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
 
-        Returns
-        -------
-        TestResult
-            Outcome for this mutant.
-        """
-        mutant_path = Path(mutant.mutant_path)
-        mutant_dir  = str(mutant_path.parent)
-
-        # Inject mutant directory at the front of PYTHONPATH while preserving
-        # site-packages so imports like pyspark are resolved correctly
         env = os.environ.copy()
         current_pythonpath = env.get("PYTHONPATH", "").strip()
-        
-        # Add spark python directory to path if not already there
-        spark_python_path = "/opt/bitnami/spark/python"
-        path_parts = [mutant_dir]
-        
+        spark_python_path  = "/opt/bitnami/spark/python"
+
+        path_parts = [str(sandbox_dir)]
         if spark_python_path not in current_pythonpath:
             path_parts.append(spark_python_path)
-        
         if current_pythonpath:
             path_parts.append(current_pythonpath)
-        
+
         env["PYTHONPATH"] = os.pathsep.join(path_parts)
 
-        cmd = [
-            "pytest",
-            str(self.config.tests_path),
-            "-x",
-            "-q",
-            "--tb=short",
-        ]
+        cmd = ["pytest", str(self.config.tests_path), "-x", "-q", "--tb=short"]
 
         start = time.perf_counter()
         try:
@@ -213,7 +137,6 @@ class TestRunner:
                 env=env,
                 timeout=120,
             )
-
             duration     = time.perf_counter() - start
             status       = self._classify(proc.returncode)
             failed_tests = self._extract_failed_tests(proc.stdout)
@@ -234,20 +157,11 @@ class TestRunner:
                 execution_time=round(duration, 4),
             )
 
+        finally:
+            shutil.rmtree(sandbox_dir, ignore_errors=True)
+
     @staticmethod
     def _classify(exit_code: int) -> str:
-        """
-        Map a pytest exit code to a mutant status string.
-
-        Codes
-        -----
-        0 → survived  (all tests passed)
-        1 → killed    (at least one test failed)
-        2 → error     (interrupted)
-        3 → error     (internal pytest error)
-        4 → error     (command-line usage error)
-        5 → error     (no tests collected)
-        """
         if exit_code == 0:
             return "survived"
         if exit_code == 1:
@@ -256,28 +170,11 @@ class TestRunner:
 
     @staticmethod
     def _extract_failed_tests(stdout: str) -> list[str]:
-        """
-        Parse pytest's ``-q`` output and return a list of failed test ids.
-
-        Pytest prints each failure as ``FAILED path::test_name`` on its
-        own line — this method collects those names.
-
-        Parameters
-        ----------
-        stdout : str
-            Captured standard output from the pytest subprocess.
-
-        Returns
-        -------
-        list[str]
-            Failed test identifiers, empty if none found.
-        """
         failed: list[str] = []
         for line in stdout.splitlines():
             stripped = line.strip()
             if stripped.startswith("FAILED "):
-                test_id = stripped[len("FAILED "):].strip()
-                failed.append(test_id)
+                failed.append(stripped[len("FAILED "):].strip())
         return failed
 
     # ------------------------------------------------------------------ #
@@ -287,8 +184,7 @@ class TestRunner:
     def _validate_mutant_list(self) -> None:
         if not isinstance(self.mutant_list, list):
             raise TypeError(
-                f"[TestRunner] mutant_list must be a list, "
-                f"got: {type(self.mutant_list)}"
+                f"[TestRunner] mutant_list must be a list, got: {type(self.mutant_list)}"
             )
 
     def _validate_config(self) -> None:
@@ -298,13 +194,13 @@ class TestRunner:
                 f"got: {type(self.config)}"
             )
         if not self.config.tests_path or not self.config.tests_path.strip():
-            raise ValueError(
-                "[TestRunner] config.tests_path must be a non-empty string."
-            )
+            raise ValueError("[TestRunner] config.tests_path must be a non-empty string.")
         if not Path(self.config.tests_path).exists():
             raise FileNotFoundError(
                 f"[TestRunner] tests_path not found: {self.config.tests_path}"
             )
+        if not self.config.workspace_dir or not self.config.workspace_dir.strip():
+            raise ValueError("[TestRunner] config.workspace_dir must be a non-empty string.")
 
     def _validate_max_workers(self) -> None:
         if not isinstance(self.max_workers, int) or self.max_workers < 1:
@@ -312,10 +208,6 @@ class TestRunner:
                 f"[TestRunner] max_workers must be a positive integer, "
                 f"got: {self.max_workers!r}"
             )
-
-    # ------------------------------------------------------------------ #
-    # Dunder helpers                                                       #
-    # ------------------------------------------------------------------ #
 
     def __repr__(self) -> str:
         return (
