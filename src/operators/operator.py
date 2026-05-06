@@ -238,11 +238,11 @@ class Operator(ABC):
         filename: str,
     ) -> str:
         """
-        Grava o mutante em mutant_dir/<OPERATOR_NAME>/filename.
+        Grava o mutante em mutant_dir/filename.
         Retorna o caminho absoluto do arquivo gerado.
         """
         source = ast.unparse(mutated_ast)
-        path = Path(mutant_dir) / self.name / filename  # ← subpasta por operador
+        path = Path(mutant_dir) / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source, encoding="utf-8")
         return str(path.resolve())
