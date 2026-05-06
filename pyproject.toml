@@ -9,7 +9,7 @@ description = "Mutation testing for PySpark DataFrame pipelines"
 readme      = "README.md"
 requires-python = ">=3.10"
 license     = { text = "MIT" }
-keywords    = ["mutation testing", "pyspark", "testing", "quality", "dataframe"]
+keywords    = ["mutation testing", "pyspark", "testing", "quality", "dataframe", "spark"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -26,12 +26,24 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "hatch",
+    "ruff",
+    "mypy",
+]
+
 [project.scripts]
 transmut = "src.cli.cli:main"
 
 [project.urls]
-Homepage   = "https://github.com/seu-user/TransmutPySpark"
-Repository = "https://github.com/seu-user/TransmutPySpark"
+Homepage      = "https://github.com/seu-user/TransmutPySpark"
+Repository    = "https://github.com/seu-user/TransmutPySpark"
+"Bug Tracker" = "https://github.com/seu-user/TransmutPySpark/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[tool.ruff]
+line-length    = 100
+target-version = "py310"

@@ -1,66 +1,187 @@
 # TransmutPySpark
 
-**Mutation testing para pipelines PySpark com a DataFrame API.**
+**Mutation testing para pipelines PySpark com DataFrame API.**
 
-TransmutPySpark avalia a qualidade dos seus testes unitários aplicando mutações cirúrgicas no código PySpark e verificando se os testes detectam as mudanças. O resultado é um **Mutation Score** — a porcentagem de mutantes que seus testes conseguiram matar.
+TransmutPySpark mede a qualidade dos seus testes unitários aplicando mutações cirúrgicas no código PySpark e verificando se os testes detectam as mudanças. O resultado é um **Mutation Score** — a porcentagem de mutantes que seus testes conseguem "matar".
+
+```
+Mutation Score : 73%  (97 killed / 133 total)
+Sobreviventes  : 36 mutantes não detectados
+Relatório      : TransmutPysparkOutput/report.html
+```
+
+Um mutante **sobrevivente** indica um caso de teste que está faltando na sua suite. O relatório mostra o diff exato de cada sobrevivente para guiar o que você precisa testar.
 
 ---
 
-## Como funciona
+## Sumário
 
-```
-Seu código ETL          Seus testes unitários
-     │                         │
-     └──────────┬──────────────┘
-                ▼
-        [ AST Analyzer ]
-        Descobre funções elegíveis
-        Ignora main(), I/O puro, dunders
-        Mapeia test → função
-                ▼
-        [ Operadores de Mutação ]
-        Gera variantes do código
-        (negações, substituições, trocas)
-                ▼
-        [ Test Runner ]
-        Executa pytest para cada mutante
-        Em paralelo, isolado por subprocess
-                ▼
-        [ Reporter ]
-        Calcula Mutation Score
-        Gera report.html com diffs
-```
-
-A ferramenta nunca modifica seus arquivos originais. Cada mutante é um arquivo separado executado em sandbox isolado.
+- [Instalação via pip](#instalação-via-pip)
+- [Instalação via git clone](#instalação-via-git-clone)
+- [Início rápido](#início-rápido)
+- [Estrutura esperada do projeto](#estrutura-esperada-do-projeto)
+- [Configuração](#configuração)
+- [Operadores de mutação](#operadores-de-mutação)
+- [Como funciona internamente](#como-funciona-internamente)
+- [Saída gerada](#saída-gerada)
+- [Interpretando o Mutation Score](#interpretando-o-mutation-score)
+- [Integração com CI](#integração-com-ci)
+- [Contribuindo — adicionando novos operadores](#contribuindo--adicionando-novos-operadores)
+- [Referência de comandos](#referência-de-comandos)
+- [Requisitos](#requisitos)
 
 ---
 
-## Instalação
+## Instalação via pip
 
 ```bash
-# Recomendado: pipx (gerencia o venv automaticamente)
 pipx install transmutpyspark
+```
 
-# Ou com pip
+> **Recomendado:** `pipx` gerencia o ambiente automaticamente e expõe o comando `transmut` no PATH sem precisar ativar nenhum venv.
+>
+> Se não tiver pipx: `sudo apt install pipx && pipx ensurepath`
+
+Alternativa com pip:
+
+```bash
 pip install transmutpyspark
 ```
 
-> **Requisito:** Java 8+ instalado (necessário para o PySpark).
-> No Ubuntu/Debian: `sudo apt install default-jdk-headless`
+---
+
+## Instalação via git clone
+
+Para desenvolver a ferramenta, contribuir com novos operadores ou usá-la diretamente do repositório:
+
+**1. Clone o repositório**
+
+```bash
+git clone https://github.com/seu-user/TransmutPySpark.git
+cd TransmutPySpark
+```
+
+**2. Crie e ative um ambiente virtual**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+> No Windows: `.venv\Scripts\activate`
+
+**3. Instale em modo editável**
+
+```bash
+pip install -e .
+```
+
+O modo `-e` (editable) faz com que qualquer alteração no código fonte seja refletida imediatamente sem reinstalar — ideal para desenvolvimento. O comando `transmut` ficará disponível enquanto o venv estiver ativo.
+
+**4. Confirme a instalação**
+
+```bash
+transmut --help
+```
+
+**Para ativar o venv automaticamente em novos terminais**, adicione ao seu `~/.bashrc` ou `~/.zshrc`:
+
+```bash
+echo "source ~/caminho/para/TransmutPySpark/.venv/bin/activate" >> ~/.bashrc
+source ~/.bashrc
+```
 
 ---
 
-## Uso rápido
+## Início rápido
 
-### 1. Inicializar a configuração
+```bash
+# 1. Vai para a raiz do seu projeto PySpark
+cd meu_projeto/
 
-Na raiz do seu projeto ETL:
+# 2. Cria o arquivo de configuração
+transmut init --src etl_code/ --tests tests/
+
+# 3. Roda o pipeline de mutação
+transmut run
+
+# 4. Abre o relatório no browser
+transmut show
+```
+
+---
+
+## Estrutura esperada do projeto
+
+TransmutPySpark funciona com qualquer estrutura de projeto PySpark. Os padrões mais comuns:
+
+**Estrutura flat (pipelines simples):**
+```
+meu_projeto/
+├── etl_code/
+│   ├── transformations.py
+│   ├── aggregations.py
+│   └── filters.py
+└── tests/
+    ├── test_transformations.py
+    ├── test_aggregations.py
+    └── test_filters.py
+```
+
+**Estrutura modular (projetos maiores):**
+```
+meu_projeto/
+├── jobs/
+│   ├── sales/
+│   │   └── transforms.py
+│   └── inventory/
+│       └── transforms.py
+└── tests/
+    ├── sales/
+    │   └── test_transforms.py
+    └── inventory/
+        └── test_transforms.py
+```
+
+A ferramenta descobre automaticamente todos os arquivos `.py` recursivamente, ignorando `__init__.py`, `conftest.py`, `setup.py` e pastas como `.venv`, `__pycache__`, `.git`.
+
+---
+
+## Configuração
+
+### Modo A — flags diretas (sem arquivo de config)
+
+Ideal para uso pontual ou scripts de CI:
+
+```bash
+transmut run --src etl_code/ --tests tests/
+```
+
+```bash
+# Arquivo único
+transmut run \
+  --src etl_code/transformations.py \
+  --tests tests/test_transformations.py
+
+# Só alguns operadores
+transmut run --src etl_code/ --tests tests/ --operators NFTP MTR
+
+# Com mais workers paralelos
+transmut run --src etl_code/ --tests tests/ --workers 8
+
+# Com logs detalhados
+transmut run --src etl_code/ --tests tests/ --verbose
+```
+
+### Modo B — transmut.toml (recomendado)
+
+Cria uma vez, versiona junto com o projeto:
 
 ```bash
 transmut init --src etl_code/ --tests tests/
 ```
 
-Isso cria um `transmut.toml`:
+Edite o `transmut.toml` gerado:
 
 ```toml
 [transmut]
@@ -70,228 +191,257 @@ operators     = ["MTR", "NFTP", "ATR", "UTS"]
 workspace_dir = "."
 ```
 
-### 2. Executar
+Depois é só:
 
 ```bash
 transmut run
 ```
 
-Saída no terminal:
-
-```
-TransmutPySpark — Mutation Testing para pipelines PySpark
-──────────────────────────────────────────────────────────
-...
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Mutation Score : 73%  (97 killed / 133 total)
-  Sobreviventes  : 36 mutante(s) não detectados
-  Relatório      : TransmutPysparkOutput/report.html
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
-
-### 3. Ver o relatório
-
-```bash
-transmut show
-```
-
-Abre o `report.html` no browser com o breakdown completo por arquivo fonte e operador.
-
----
-
-## Formas de configurar
-
-### Flags diretas (sem arquivo de config)
-
-```bash
-transmut run --src etl_code/ --tests tests/
-transmut run --src etl_code/transforms.py --tests tests/test_transforms.py
-transmut run --src etl_code/ --tests tests/ --operators NFTP MTR
-```
-
-### transmut.toml (recomendado para uso contínuo)
-
-```toml
-[transmut]
-source_dirs   = ["etl_code/", "transformations/"]
-tests_dirs    = ["tests/"]
-operators     = ["MTR", "NFTP", "ATR", "UTS"]
-workspace_dir = "."
-```
-
-```bash
-transmut run   # detecta o toml automaticamente
-```
-
-### config.txt (formato legado)
-
-```
-program_path   = etl_code/transforms.py
-tests_path     = tests/test_transforms.py
-operators_list = MTR, NFTP, ATR, UTS
-workspace_dir  = .
-```
+### Modo C — config.txt (compatibilidade com versões anteriores)
 
 ```bash
 transmut run --config config.txt
+```
+
+```ini
+program_path   = etl_code/transformations.py
+tests_path     = tests/test_transformations.py
+operators_list = MTR, NFTP, ATR, UTS
+workspace_dir  = .
 ```
 
 ---
 
 ## Operadores de mutação
 
-### MTR — Mapping Transformation Replacement
-
-Substitui expressões em transformações de mapeamento por valores limite.
-
-```python
-# Original
-df.withColumn("revenue", col("price") * col("qty"))
-
-# Mutantes gerados
-df.withColumn("revenue", 0)
-df.withColumn("revenue", 1)
-df.withColumn("revenue", None)
-df.withColumn("revenue", "")
-```
-
-**Detecta:** falhas em cálculos e transformações de colunas.
+TransmutPySpark implementa quatro operadores específicos para a DataFrame API do PySpark. Cada operador implementa a classe abstrata `Operator` e é responsável por identificar nós elegíveis na AST e gerar os arquivos mutantes.
 
 ---
 
-### NFTP — Negation of Filter/where Transformation Predicate
+### NFTP — Negation of Filter Transformation Predicate
 
-Inverte ou nega predicados em operações de filtro.
+**Alvo:** operações `.filter()` e `.where()` com predicados booleanos.
 
 ```python
 # Original
-df.filter(col("status") == "active")
-
-# Mutantes gerados
-df.filter(~(col("status") == "active"))   # negação total
-df.filter(col("status") != "active")      # inversão de operador
+df.filter(col("fare_amount") >= 2.5)
+df.where(col("status").isNotNull() & (col("distance") > 0))
 ```
 
-**Detecta:** falhas na lógica de filtragem de dados.
+**Mutações geradas:**
+
+| Tipo | Original | Mutante |
+|------|----------|---------|
+| Negação total | `pred` | `~pred` |
+| Inversão de comparação | `>` | `<=` |
+| Inversão de comparação | `==` | `!=` |
+| Inversão de comparação | `>=` | `<` |
+| Inversão lógica | `&` | `\|` |
+| Inversão lógica | `\|` | `&` |
+| Swap null check | `isNull` | `isNotNull` |
+| Negação de isin | `isin(...)` | `~isin(...)` |
+
+**Detecta:** predicados invertidos, condições de borda ausentes, lógica booleana incorreta.
+
+---
+
+### MTR — Mapping Transformation Replacement
+
+**Alvo:** operações `.withColumn()`, `.select()`, `.map()`, `.mapInPandas()`.
+
+```python
+# Original
+df.withColumn("valor_por_km", col("fare_amount") / col("trip_distance"))
+df.select("trip_id", "region", "fare_amount")
+```
+
+**Mutações geradas:**
+
+Cada expressão nas transformações é substituída por valores limite:
+
+| Label | Substituto |
+|-------|-----------|
+| `zero` | `0` |
+| `one` | `1` |
+| `neg_one` | `-1` |
+| `none` | `None` |
+| `empty_str` | `""` |
+| `negated` | `-<expr>` |
+| `identity` | `col(...)` (quando aplicável) |
+
+**Detecta:** cálculos incorretos, expressões que nunca foram testadas com valores limite, ausência de validação de `None`.
 
 ---
 
 ### ATR — Aggregation Transformation Replacement
 
-Substitui funções de agregação por equivalentes semânticos distintos.
+**Alvo:** operações de agregação e funções de janela.
 
 ```python
 # Original
-df.groupBy("region").agg(F.sum("amount"))
-
-# Mutantes gerados
-df.groupBy("region").agg(F.avg("amount"))
-df.groupBy("region").agg(F.max("amount"))
-df.groupBy("region").agg(F.count("amount"))
+df.groupBy("region").agg(F.sum("fare_amount").alias("total"))
+ranked_df = df.withColumn("rank", F.rank().over(window_spec))
 ```
 
-**Detecta:** testes que não verificam a função de agregação correta.
+**Mutações geradas:**
 
----
+Substituição de função de agregação:
 
-### UTS — Utility Transformation Substitution
+| Original | Mutantes gerados |
+|----------|-----------------|
+| `sum` | `avg`, `max`, `min`, `count`, `first`, `last` |
+| `count` | `sum`, `avg`, `max`, `min`, `first`, `last` |
+| `avg` | `sum`, `max`, `min`, `count`, `first`, `last` |
 
-Troca a ordem de transformações independentes consecutivas.
+Substituição de função de janela:
+
+| Original | Mutantes gerados |
+|----------|-----------------|
+| `rank` | `dense_rank`, `row_number`, `percent_rank`, `cume_dist` |
+| `dense_rank` | `rank`, `row_number`, `percent_rank`, `cume_dist` |
+
+Remoção de chave de agrupamento:
 
 ```python
 # Original
-df.filter(...).select(...)   # Par independente
+df.groupBy("driver_id", "region").count()
 
-# Mutante gerado
-df.select(...).filter(...)   # Ordem trocada
+# Mutantes
+df.groupBy("region").count()      # remove "driver_id"
+df.groupBy("driver_id").count()   # remove "region"
 ```
 
-**Detecta:** dependências ocultas entre transformações na pipeline.
+**Detecta:** função de agregação errada, granularidade incorreta no `groupBy`, funções de janela inadequadas.
 
 ---
 
-## Estrutura de saída
+### UTS — Unary Transformations Swap
 
-Após executar, o diretório `TransmutPysparkOutput/` é criado:
+**Alvo:** pares de operações consecutivas sem dependência de coluna entre si.
+
+```python
+# Original — filter depois select, sem dependência
+df.filter(col("fare_amount") >= 2.5).select("trip_id", "fare_amount")
+
+# Mutante — ordem trocada
+df.select("trip_id", "fare_amount").filter(col("fare_amount") >= 2.5)
+```
+
+O operador analisa dependências de coluna: se a segunda operação usa uma coluna criada pela primeira (ex: `withColumn` seguido de `filter` nessa coluna), o par **não é elegível** e não gera mutante.
+
+**Detecta:** dependências implícitas de ordem, transformações que produzem resultados diferentes dependendo da sequência de aplicação.
+
+---
+
+## Como funciona internamente
+
+```
+transmut run
+    │
+    ├── ConfigLoader
+    │   Detecta o modo de entrada (arquivo, diretório ou transmut.toml)
+    │   e normaliza tudo em um ResolvedConfig uniforme.
+    │
+    ├── AST Analyzer
+    │   ├── Descoberta    percorre a AST com ast.walk() buscando
+    │   │                 FunctionDef e ClassDef elegíveis
+    │   ├── Filtragem     ignora main(), funções de I/O puro, dunders,
+    │   │                 funções privadas de módulo, decoradores de
+    │   │                 orquestração (@dag, @task, @flow...)
+    │   └── Mapeamento    vincula cada função aos seus testes via
+    │                     análise de imports (Estratégia B) combinada
+    │                     com convenção de nomes (Estratégia A)
+    │
+    ├── MutationManager
+    │   ├── parse_to_ast()
+    │   │   Parseia cada arquivo fonte em AST separada.
+    │   │   Mantém um dict { source_file → AST } para isolar
+    │   │   completamente os arquivos entre si.
+    │   │
+    │   ├── apply_mutation()
+    │   │   Para cada FunctionTarget × Operador:
+    │   │     1. operator.analyse_ast(target.node)
+    │   │        O operador analisa APENAS o nó da função — não o arquivo
+    │   │     2. operator.build_mutant(nodes, file_ast, ...)
+    │   │        Gera arquivo .py COMPLETO com a função mutada
+    │   │        usando _replace_node() + ast.unparse()
+    │   │     3. Propaga test_files e test_functions para o Mutant
+    │   │
+    │   └── run_tests()
+    │       Para cada mutante, em paralelo (ThreadPoolExecutor):
+    │         - Cria sandbox isolado com o arquivo mutante
+    │         - Injeta etl_code/ no PYTHONPATH do subprocess
+    │         - Executa: python -m pytest <test_files> -k <test_functions>
+    │         - Classifica: killed / survived / error / timeout
+    │
+    └── Reporter
+        Gera report.html organizado por:
+          arquivo fonte → operador → mutante
+        com diff correto (original vs mutante) e código fonte completo
+```
+
+### Por que escopo cirúrgico por função?
+
+A ferramenta não muta o arquivo inteiro de uma vez. Para cada mutante:
+
+1. O `analyse_ast` recebe apenas o **nó AST da função alvo** — não o arquivo
+2. O `build_mutant` recebe a **AST completa do arquivo** para gerar um `.py` válido, mas substitui **apenas o nó da função**
+3. O `pytest` roda apenas os **testes mapeados** para aquela função específica
+
+Isso reduz drasticamente o tempo de execução e mantém os resultados precisos — um mutante não contamina a análise de outro.
+
+---
+
+## Saída gerada
 
 ```
 TransmutPysparkOutput/
-├── report.html          ← relatório visual completo
-├── mutants/
-│   ├── atr/             ← mutantes do arquivo atr.py
-│   │   ├── ATR/         ← gerados pelo operador ATR
-│   │   └── MTR/         ← gerados pelo operador MTR
-│   ├── mtr/
-│   │   └── MTR/
-│   ├── nftp/
-│   │   └── NFTP/
-│   └── uts/
-│       ├── MTR/
-│       └── NFTP/
-└── sandboxes/           ← diretórios de execução (removidos após uso)
+├── report.html              relatório visual interativo
+└── mutants/
+    ├── transformations/     mutantes de transformations.py
+    │   ├── MTR/             gerados pelo operador MTR
+    │   │   ├── MTR_1_withColumn_expr0_zero.py
+    │   │   ├── MTR_2_withColumn_expr0_one.py
+    │   │   └── ...
+    │   └── NFTP/
+    │       └── ...
+    └── aggregations/
+        └── ATR/
+            └── ...
 ```
 
----
+### Relatório HTML
 
-## Relatório HTML
-
-O relatório organiza os resultados em três níveis:
+O relatório é organizado em três níveis colapsáveis:
 
 ```
-📄 atr.py  (81 mutants · 2 operators)  Score: 65%
-  └── ATR  15 mutants
-        ├── ATR_1  KILLED    ← diff + código do mutante
-        ├── ATR_2  SURVIVED  ← testes que falharam
+📄 transformations.py  (42 mutants · 2 operators)  Score: 65%
+  └── MTR  36 mutants   24 killed · 10 survived · 2 error
+        └── 001  line 14 | withColumn() expr → zero  SURVIVED  0.3s
+              ├── Diff           linha exata alterada em vermelho/verde
+              └── Mutant source  arquivo .py completo do mutante
+
+  └── NFTP  6 mutants   6 killed
         └── ...
-  └── MTR  66 mutants
-        └── ...
-
-📄 mtr.py  (18 mutants · 1 operator)
-  └── ...
 ```
 
-Para cada mutante, o relatório mostra:
-- **Status**: killed / survived / timeout / error
-- **Diff**: comparação linha a linha com o arquivo original correto
-- **Mutant source**: código completo do arquivo mutante
-- **Failed tests**: quais testes detectaram o mutante (quando killed)
+Cada entrada mostra o status (`KILLED` / `SURVIVED` / `ERROR` / `TIMEOUT`), o tempo de execução, os testes que falharam (quando killed), o diff e o código fonte completo do mutante.
 
 ---
 
-## Como a ferramenta decide o que mutar
+## Interpretando o Mutation Score
 
-O `ast_analyzer` percorre a AST de cada arquivo fonte e aplica os seguintes filtros:
-
-**Incluídas como alvo:**
-- Funções de módulo com lógica de transformação DataFrame
-- Métodos de classe com transformações
-
-**Excluídas automaticamente:**
-- `main()`, `setup()`, `teardown()` e variantes
-- Funções de I/O puro (só leitura/escrita, sem transformação)
-- Dunders (`__init__`, `__repr__`, etc.)
-- Funções privadas de módulo (prefixo `_`)
-- Funções com decoradores de orquestração (`@task`, `@dag`, `@flow`)
-
----
-
-## Mapeamento automático de testes
-
-A ferramenta mapeia automaticamente quais testes cobrem cada função, usando duas estratégias combinadas:
-
-**Estratégia A — imports:** identifica quais arquivos de teste importam o módulo fonte.
-
-**Estratégia B — nomes:** cruza os nomes das funções de teste com os nomes das funções alvo.
-
-```python
-# test_transforms.py importa transforms.py  ← estratégia A
-from transforms import compute_revenue
-
-def test_compute_revenue_basic():   # casa com compute_revenue  ← estratégia B
-    ...
+```
+Mutation Score = mutantes killed / total de mutantes
 ```
 
-Isso permite que o `TestRunner` execute **só os testes relevantes** para cada mutante, reduzindo significativamente o tempo de execução.
+| Score | Classificação | O que significa |
+|-------|--------------|----------------|
+| ≥ 80% | **STRONG** | Suite robusta — a maioria das mutações é detectada |
+| 50–79% | **MODERATE** | Gaps importantes — lógica de negócio com pouca cobertura |
+| < 50% | **WEAK** | Testes insuficientes — mutações passam sem ser detectadas |
+
+**Como usar os resultados:** filtre os mutantes com status `SURVIVED` no relatório. O diff mostra exatamente o que foi alterado — escreva um teste que falhe com aquela alteração e passe com o código original.
 
 ---
 
@@ -315,21 +465,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Java (required by PySpark)
-        run: sudo apt-get install -y default-jdk-headless
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "11"
+          distribution: "temurin"
 
       - run: pip install transmutpyspark
 
       - run: transmut run --src etl_code/ --tests tests/
-
-      - name: Check minimum score
-        run: |
-          python3 -c "
-          import json, sys
-          # lê o score do relatório
-          # adapte conforme seu threshold
-          print('Mutation testing concluído')
-          "
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -340,15 +483,231 @@ jobs:
 
 ---
 
-## Publicar no PyPI
+## Contribuindo — adicionando novos operadores
 
-```bash
-pip install build twine
+Toda a lógica de mutação está isolada em operadores independentes. Adicionar um novo operador não requer modificar nenhum outro arquivo da ferramenta — basta criar uma classe que herda de `Operator` e registrá-la.
 
-python -m build
-twine upload dist/*
+### Estrutura da classe abstrata
+
+```python
+# src/operators/operator.py (resumo)
+@dataclass
+class Operator(ABC):
+    id:               int
+    name:             str
+    mutant_registers: str | list[str]   # métodos/nós alvo
+    mutant_list:      list[Mutant]      # populado pelo build_mutant
+
+    @abstractmethod
+    def analyse_ast(self, tree: ast.AST) -> list[ast.AST]:
+        """
+        Recebe o nó AST da função alvo.
+        Retorna a lista de nós elegíveis para mutação.
+        """
+        ...
+
+    @abstractmethod
+    def build_mutant(self,
+                     nodes: list[ast.AST],
+                     original_ast: ast.AST,
+                     original_path: str,
+                     mutant_dir: str) -> list[Mutant]:
+        """
+        Recebe os nós encontrados e a AST completa do arquivo.
+        Gera um arquivo .py mutante por nó e popula self.mutant_list.
+        """
+        ...
 ```
 
-Crie sua conta em [pypi.org](https://pypi.org) e gere um API token em *Account Settings → API tokens*.
+**Helpers disponíveis na classe base** (não precisam ser reimplementados):
+
+| Método | O que faz |
+|--------|-----------|
+| `_replace_node(original_ast, target, replacement)` | Clona a AST e substitui `target` por `replacement` — localiza o nó por `lineno + col_offset + unparse` |
+| `_write_mutant_file(mutated_ast, mutant_dir, filename)` | Converte AST para código com `ast.unparse()` e grava em disco |
+| `_next_mutant_id()` | Retorna o próximo ID sequencial para o mutante |
+| `_assert_valid_tree(tree)` | Valida que `tree` é um `ast.AST` |
+| `_assert_valid_nodes(nodes)` | Valida que `nodes` é lista de `ast.AST` |
+| `_assert_valid_path(path, name)` | Valida que o path é string não vazia |
+| `_log_analyse_ast_found(count, description)` | Log padronizado de nós encontrados |
+| `_log_mutant_created(id, details)` | Log padronizado de mutante criado |
+| `_log_build_mutant_done()` | Log de conclusão com total de mutantes |
+
+### Passo a passo: criando um operador novo
+
+**Exemplo:** operador `JFR` (Join Filter Removal) que remove condições de `.join()`.
+
+**1. Crie o arquivo `src/operators/operator_jfr.py`:**
+
+```python
+# src/operators/operator_jfr.py
+"""
+JFR – Join Filter Removal
+==========================
+Alvo: operações df.join(other, on=condition, how=...)
+Mutação: remove a condição de join, substituindo por join sem filtro
+"""
+
+import ast
+import copy
+from dataclasses import dataclass, field
+
+from src.model.mutant import Mutant
+from src.operators.operator import Operator
+
+
+@dataclass
+class OperatorJFR(Operator):
+    # Atributos de classe usados pelo factory Operator.create()
+    _DEFAULT_ID        = 5
+    _DEFAULT_NAME      = "JFR"
+    _DEFAULT_REGISTERS = ["join"]
+
+    id:               int             = 5
+    name:             str             = "JFR"
+    mutant_registers: list[str]       = field(
+        default_factory=lambda: ["join"]
+    )
+
+    def analyse_ast(self, tree: ast.AST) -> list[ast.AST]:
+        """
+        Encontra todas as chamadas .join() com condição explícita.
+        Retorna a lista de call nodes elegíveis.
+        """
+        self._assert_valid_tree(tree)
+        eligible = []
+
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "join"
+                and len(node.args) >= 2   # join(other, condition, ...)
+            ):
+                eligible.append(node)
+
+        self._log_analyse_ast_found(
+            len(eligible), "join() calls with explicit condition"
+        )
+        return eligible
+
+    def build_mutant(
+        self,
+        nodes:        list[ast.AST],
+        original_ast: ast.AST,
+        original_path: str,
+        mutant_dir:   str,
+    ) -> list[Mutant]:
+        self._assert_valid_nodes(nodes)
+        self._assert_valid_path(original_path, "original_path")
+        self._assert_valid_path(mutant_dir, "mutant_dir")
+
+        for join_call in nodes:
+            # Clona o nó e remove o segundo argumento (a condição)
+            mutated_call       = copy.deepcopy(join_call)
+            original_condition = ast.unparse(mutated_call.args[1])
+            mutated_call.args  = [mutated_call.args[0]]  # só "other"
+
+            # Substitui o nó na AST completa do arquivo
+            mutated_ast = self._replace_node(
+                original_ast, join_call, mutated_call
+            )
+
+            mid      = self._next_mutant_id()
+            filename = f"JFR_{mid}_join_remove_condition.py"
+            path     = self._write_mutant_file(mutated_ast, mutant_dir, filename)
+
+            mutant = Mutant(
+                id=mid,
+                operator=self.name,
+                original_path=original_path,
+                mutant_path=path,
+                modified_line=str(getattr(join_call, "lineno", "?")),
+            )
+            self.mutant_list.append(mutant)
+            self._log_mutant_created(
+                mid,
+                f"line {mutant.modified_line} | "
+                f"join() condition removed | "
+                f"original: {original_condition} [{filename}]"
+            )
+
+        self._log_build_mutant_done()
+        return self.mutant_list
+```
+
+**2. Registre o operador no `MutationManager`:**
+
+```python
+# src/mutation_manager.py
+OPERATOR_REGISTRY = {
+    "NFTP": "src.operators.operator_nftp.OperatorNFTP",
+    "MTR":  "src.operators.operator_mtr.OperatorMTR",
+    "ATR":  "src.operators.operator_atr.OperatorATR",
+    "UTS":  "src.operators.operator_uts.OperatorUTS",
+    "JFR":  "src.operators.operator_jfr.OperatorJFR",  # ← adiciona aqui
+}
+```
+
+**3. Use o novo operador:**
+
+```bash
+transmut run --src etl_code/ --tests tests/ --operators JFR
+
+# Ou adicione ao transmut.toml
+operators = ["MTR", "NFTP", "ATR", "UTS", "JFR"]
+```
+
+### Regras para um bom operador
+
+- `analyse_ast` deve receber o **nó da função** (não o arquivo inteiro) e retornar apenas nós dentro desse escopo
+- `build_mutant` **nunca modifica `original_ast` in place** — use sempre `_replace_node()` que faz `deepcopy` internamente
+- Um mutante por substituição — não agrupe múltiplas mutações em um único arquivo
+- Use os helpers de log (`_log_analyse_ast_found`, `_log_mutant_created`, `_log_build_mutant_done`) para manter consistência no output
+- Nomeie os arquivos com o padrão `OPERADOR_id_descricao.py`
+
+### Abrindo um Pull Request
+
+1. Crie uma branch: `git checkout -b operador/JFR`
+2. Implemente o operador seguindo o padrão acima
+3. Adicione testes unitários em `tests/operators/test_operator_jfr.py`
+4. Registre no `OPERATOR_REGISTRY`
+5. Documente no `README.md`
+6. Abra o PR descrevendo qual padrão de código o operador muta e quais bugs ele detecta
 
 ---
+
+## Referência de comandos
+
+```
+transmut init   [--src PATH] [--tests PATH] [--output DIR]
+    Cria transmut.toml no diretório atual com configuração padrão.
+
+transmut run    [--src PATH] [--tests PATH]
+                [--operators OP [OP ...]]
+                [--config FILE]
+                [--output DIR]
+                [--workers N]
+                [--verbose / -v]
+    Executa o pipeline completo de mutation testing.
+    Se nenhuma flag for passada, detecta transmut.toml ou config.txt
+    automaticamente na raiz do diretório atual.
+
+transmut show
+    Abre o report.html mais recente no browser padrão.
+```
+
+---
+
+## Requisitos
+
+- Python 3.10+
+- Java 8+ (necessário para o PySpark inicializar o contexto Spark)
+- PySpark 3.3+ (instalado automaticamente como dependência)
+- pytest 7.0+
+
+---
+
+## Licença
+
+MIT
