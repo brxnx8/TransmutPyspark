@@ -84,16 +84,41 @@ def _columns_created(call: ast.Call) -> set[str]:
 
 def _columns_referenced(call: ast.Call) -> set[str]:
     names: set[str] = set()
+
+    # Pre-computar o conjunto de nos que sao .func de um ast.Call,
+    # para distinguir chamadas de metodo (ex: .filter) de atributos de coluna (ex: df.nome).
+    method_func_nodes: set[int] = set()
     for node in ast.walk(call):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        is_col = (
-            (isinstance(func, ast.Name) and func.id == "col") or
-            (isinstance(func, ast.Attribute) and func.attr == "col")
-        )
-        if is_col and node.args and isinstance(node.args[0], ast.Constant):
-            names.add(node.args[0].value)
+        if isinstance(node, ast.Call):
+            method_func_nodes.add(id(node.func))
+
+    for node in ast.walk(call):
+        # col("nome") ou F.col("nome")
+        if isinstance(node, ast.Call):
+            func = node.func
+            is_col = (
+                (isinstance(func, ast.Name) and func.id == "col") or
+                (isinstance(func, ast.Attribute) and func.attr == "col")
+            )
+            if is_col and node.args and isinstance(node.args[0], ast.Constant):
+                names.add(node.args[0].value)
+
+        # df["nome"]
+        elif (
+            isinstance(node, ast.Subscript) and
+            isinstance(node.slice, ast.Constant) and
+            isinstance(node.slice.value, str)
+        ):
+            names.add(node.slice.value)
+
+        # df.nome -- apenas atributos que nao sao .func de uma chamada de metodo
+        elif (
+            isinstance(node, ast.Attribute) and
+            isinstance(node.value, ast.Name) and
+            id(node) not in method_func_nodes
+        ):
+            names.add(node.attr)
+
     return names
 
 
