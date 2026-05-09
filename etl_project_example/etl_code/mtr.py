@@ -4,6 +4,7 @@ spark = SparkSession.builder.master('local[*]').appName("Iniciando com Spark").g
 "#Importe das libs e funções necessarias"
 from pyspark.sql.functions import *
 from pyspark.sql.window import Window
+
 def mtr_function(df):
     return (
         df.withColumn(

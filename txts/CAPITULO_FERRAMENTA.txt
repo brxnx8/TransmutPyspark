@@ -1,0 +1,1013 @@
+================================================================================
+                       CAPÍTULO: A FERRAMENTA TRANSMUTPYSPARK
+                Teste de Mutação Especializado para Apache PySpark
+================================================================================
+
+1. INTRODUÇÃO À FERRAMENTA
+================================================================================
+
+TransmutPyspark é uma ferramenta de teste de mutação desenvolvida
+especificamente para validar a efetividade de suites de testes em aplicações
+Apache PySpark. O teste de mutação é uma técnica sofisticada de avaliação de
+qualidade que injeta defeitos intencionais (mutantes) no código-fonte e verifica
+se os testes conseguem detectá-los. Essa técnica é particularmente relevante
+para pipelines de processamento de dados, onde operações de transformação
+complexas podem conter erros sutis que passam despercebidos pelos testes
+convencionais.
+
+A ferramenta é construída sobre o módulo `ast` (Abstract Syntax Tree) do Python,
+permitindo análise e transformação de código sem necessidade de parsing manual.
+Seu design modular e extensível facilita a adição de novos operadores de mutação
+conforme novos cenários de teste surgem.
+
+================================================================================
+2. ARQUITETURA GERAL
+================================================================================
+
+2.1 Visão de Camadas
+────────────────────
+
+A arquitetura de TransmutPyspark segue um padrão de pipeline em camadas, onde
+cada componente possui responsabilidades bem definidas:
+
+┌─────────────────────────────────────────────────────────┐
+│          Camada de Apresentação (main.py)               │
+│      Interface com o usuário e orquestração             │
+└─────────────────────┬───────────────────────────────────┘
+                      │
+┌─────────────────────────────────────────────────────────┐
+│   Camada de Orquestração (MutationManager)              │
+│  • Coordenação do pipeline completo                     │
+│  • Carregamento de configurações                        │
+│  • Gerenciamento de estados e fluxo de dados            │
+└─────────┬─────────────────┬──────────────────┬──────────┘
+          │                 │                  │
+    ┌─────┴─ ────┐   ┌──────┴──────┐    ┌──────┴─────┐
+    │  Análise   │   │   Mutação   │    │  Teste e   │
+    │   (AST)    │   │             │    │  Relatório │
+    │            │   │ • Operadores│    │            │
+    │ • Parse    │   │ • Geração   │    │• TestRunner│
+    │ • Traversal│   │ • Escrita   │    │• Reporter  │
+    └─────┬─────┘    └──────┬──────┘    └──────┬─────┘
+          │                 │                  │
+          └─────────────────┼──────────────────┘
+                            │
+┌───────────────────────────┴────────────────────────────┐
+│      Camada de Modelos de Dados (@dataclass)           │
+│   Mutant, TestResult, ConfigLoader, Operator           │
+└────────────────────────────────────────────────────────┘
+
+
+2.2 Fluxo de Pipeline
+──────────────────────
+
+O processamento segue uma sequência linear bem definida:
+
+    load()
+        ↓ (carrega configuração)
+    parse_to_ast()
+        ↓ (converte código em AST)
+    apply_mutation()
+        ↓ (gera mutantes via operadores)
+    run_tests()
+        ↓ (executa testes contra mutantes)
+    agregate_results()
+        ↓ (calcula métricas e relatório)
+    [Relatório HTML gerado]
+
+
+================================================================================
+3. COMPONENTES PRINCIPAIS
+================================================================================
+
+3.1 MutationManager (Orquestrador Central)
+──────────────────────────────────────────
+
+O MutationManager implementa o padrão Orchestrator, coordenando toda a execução.
+Suas responsabilidades incluem:
+
+• Carregamento de Configuração: Lê arquivo em formato "key = value", valida
+  chaves obrigatórias (program_path, tests_path, operators_list)
+
+• Análise Sintática: Converte código-fonte em AST usando o módulo `ast` do Python
+  com suporte a `ast.parse()` e `ast.fix_missing_locations()`
+
+• Gerenciamento de Operadores: Implementa registro dinâmico via OPERATOR_REGISTRY,
+  permitindo carregamento lazy de operadores sem dependências estáticas
+
+• Carregamento Dinâmico: Utiliza `importlib` para instanciar operadores em tempo
+  de execução
+
+Exemplo do registro de operadores:
+
+    OPERATOR_REGISTRY = {
+        "NFTP": "src.operators.operator_nftp.OperatorNFTP",
+        "MTR": "src.operators.operator_mtr.OperatorMTR",
+    }
+
+
+3.2 Padrão Operator (Padrão Strategy)
+──────────────────────────────────────
+
+A ferramenta implementa o padrão Strategy através da classe abstrata `Operator`:
+
+    @dataclass
+    class Operator(ABC):
+        id:                int
+        name:              str
+        mutant_registers:  str | list[str]
+        mutant_list:       list[Mutant] = field(default_factory=list)
+
+        @abstractmethod
+        def analyse_ast(self, tree: ast.AST) -> list[ast.AST]:
+            """Identifica nós elegíveis para mutação"""
+            pass
+
+        @abstractmethod
+        def build_mutant(self, nodes, original_ast, original_path, mutant_dir)
+                         -> list[Mutant]:
+            """Gera mutantes a partir dos nós identificados"""
+            pass
+
+Cada operador tem responsabilidades bem definidas:
+
+• analyse_ast: Travessa a AST e retorna lista de nós para mutação
+• build_mutant: Para cada nó, cria mutantes (deep-copy, mutação, unparse, escrita)
+
+
+3.3 Camada de Testes (TestRunner)
+──────────────────────────────────
+
+O TestRunner executa testes contra todos os mutantes de forma paralela:
+
+• Estratégia de Paralelismo: Utiliza ThreadPoolExecutor com
+  max_workers = min(4, cpu_count()), limitando concorrência para evitar
+  contenção com SparkSession
+
+• Execução Isolada: Cada teste executa em subprocess separado com PYTHONPATH
+  customizado, simulando ambiente real
+
+• Comando de Teste: pytest <tests_path> -x -q --tb=short
+  - -x: para no primeiro erro (fail-fast)
+  - -q: modo quiet (menos verbosidade)
+  - --tb=short: traceback reduzido
+  - timeout=120: limite de 2 minutos por mutante
+
+• Classificação de Resultados:
+  - 0: survived (testes passaram - mutante não foi detectado)
+  - 1: killed (teste falhou - mutante foi detectado)
+  - 2-5: error (erro interno do pytest)
+  - timeout: timeout (execução excedeu limite de tempo)
+
+
+3.4 Camada de Relatório (Reporter)
+───────────────────────────────────
+
+O Reporter processa resultados e gera relatório HTML:
+
+• Cálculo de Mutation Score:
+  Score = killed / (killed + survived + timeout + error)
+  Representa a fração de mutantes detectados pelos testes
+
+• Geração de Diffs: Utiliza `difflib.unified_diff()` para comparar código
+  original vs mutado em formato padrão
+
+• Relatório HTML: Estrutura com:
+  - Summary Cards (com codificação cromática: verde ≥80%, laranja ≥50%, vermelho <50%)
+  - Tabela de Resultados (mutante, operador, linha, status, testes falhados)
+  - Seção de Diffs expansível por mutante
+  - Dump JSON para processamento automático
+
+
+================================================================================
+4. OPERADORES IMPLEMENTADOS
+================================================================================
+
+4.1 NFTP - Negation of Filter Transformation Predicate
+───────────────────────────────────────────────────────
+
+OBJETIVO: Testar a robustez de predicados em operações de filtragem
+
+ESTRATÉGIA:
+1. Identifica chamadas .filter() ou .where() com predicados
+2. Decompõe predicados compostos em sub-condições atômicas
+3. Para cada sub-condição, gera mutante com negação not (sub_condition)
+4. Evita dupla negação (detecta nós já envolvidos em UnaryOp(Not))
+
+TÉCNICA DE DECOMPOSIÇÃO:
+
+O operador atravessa a estrutura do predicado recursivamente:
+
+• ast.BoolOp (Python and/or) → descende em todos os valores
+• ast.BinOp com ast.BitAnd/BitOr (PySpark &/|) → descende esquerda e direita
+• Outros nós → tratados como folhas (candidatos a negação)
+
+
+4.1.1 Exemplo: Código Original
+──────────────────────────────
+
+    import os
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.master('local[*]').appName("Iniciando com Spark").getOrCreate()
+
+    from pyspark.sql.functions import *
+    from pyspark.sql.window import Window
+
+    def nftp_function(df):
+        return df.filter(col("trip_distance").isNotNull() &
+                        col("fare_amount").isNotNull() &
+                        (col("trip_distance") > 0.0) &
+                        (col("fare_amount") >= 2.5))
+
+
+4.1.2 Exemplo: Mutantes Gerados por NFTP
+────────────────────────────────────────
+
+MUTANTE 1 (nega col("trip_distance").isNotNull()):
+
+    def nftp_function(df):
+        return df.filter(not col("trip_distance").isNotNull() &
+                        col("fare_amount").isNotNull() &
+                        (col("trip_distance") > 0.0) &
+                        (col("fare_amount") >= 2.5))
+
+MUTANTE 2 (nega col("fare_amount").isNotNull()):
+
+    def nftp_function(df):
+        return df.filter(col("trip_distance").isNotNull() &
+                        not col("fare_amount").isNotNull() &
+                        (col("trip_distance") > 0.0) &
+                        (col("fare_amount") >= 2.5))
+
+MUTANTE 3 (nega col("trip_distance") > 0.0):
+
+    def nftp_function(df):
+        return df.filter(col("trip_distance").isNotNull() &
+                        col("fare_amount").isNotNull() &
+                        not (col("trip_distance") > 0.0) &
+                        (col("fare_amount") >= 2.5))
+
+MUTANTE 4 (nega col("fare_amount") >= 2.5):
+
+    def nftp_function(df):
+        return df.filter(col("trip_distance").isNotNull() &
+                        col("fare_amount").isNotNull() &
+                        (col("trip_distance") > 0.0) &
+                        not (col("fare_amount") >= 2.5))
+
+
+ESTRUTURA DE DIRETÓRIOS CRIADA:
+
+    mutants/
+    ├── nftp_1_filter_line10/
+    │   └── nftp.py          (Mutante 1)
+    ├── nftp_2_filter_line11/
+    │   └── nftp.py          (Mutante 2)
+    ├── nftp_3_filter_line12/
+    │   └── nftp.py          (Mutante 3)
+    └── nftp_4_filter_line13/
+        └── nftp.py          (Mutante 4)
+
+
+4.1.3 Detalhes Técnicos de NFTP
+────────────────────────────────
+
+LOCALIZAÇÃO DE NÓS:
+O operador usa coordenadas (lineno, col_offset) como chave de identidade para
+relocar nós em cópias profundas da AST. Isso permite:
+
+• Mapear nós da AST original para cópias
+• Realizar mutações isoladas sem efeitos colaterais
+• Garantir independência entre mutantes
+
+PSEUDOCÓDIGO DO ALGORITMO:
+
+    def build_mutant(nodes, original_ast, ...):
+        for call_node in nodes:
+            predicate = call_node.args[0]
+            sub_conditions = collect_subconditions(predicate)
+
+            for sub_node in sub_conditions:
+                # Fresh copy para cada mutante
+                tree_copy = deepcopy(original_ast)
+
+                # Relocate call em copy via (lineno, col_offset)
+                call_copy = find_call_in_copy(tree_copy,
+                                              call_node.lineno,
+                                              call_node.col_offset)
+
+                # Build not (sub_condition)
+                negated = UnaryOp(op=Not(), operand=copy(sub_node))
+
+                # Splice no predicate
+                replace_node_in_subtree(predicate_copy, negated)
+
+                # Unparse e escrever
+                mutant_source = unparse(tree_copy)
+                write_to_disk(mutant_source)
+                record_mutant(Mutant(...))
+
+
+4.2 MTR - Mapping Transformation Replacement
+──────────────────────────────────────────────
+
+OBJETIVO: Testar efetividade contra falhas em operações de transformação
+
+ESTRATÉGIA:
+1. Identifica chamadas de mapeamento (.map, .flatMap, .withColumn, .select, etc)
+2. Para cada chamada elegível, gera 8 mutantes, substituindo a função por
+   lambdas de limite/fronteira
+
+MÉTODOS ALVO:
+
+O operador foca em:
+• .map() - transformação RDD
+• .flatMap() - flatmap RDD
+• .withColumn() - adiciona/substitui coluna (ESPECIAL: função em arg[1])
+• .select() - projeção de colunas
+• .mapValues() - transformação de valores em PairRDD
+• .foreach() - iteração com side effects
+• .foreachPartition() - iteração por partição
+
+
+4.2.1 Função de Limite/Fronteira
+──────────────────────────────────
+
+O operador MTR substitui a função original por oito lambdas diferentes:
+
+┌──────────────────────┬──────────────────────────────────────┐
+│ Substituição         │ Rationale                            │
+├──────────────────────┼──────────────────────────────────────┤
+│ lambda *a, **k: 0    │ Valor típico (falso em booleano)    │
+│ lambda *a, **k: 1    │ Unidade (verdadeiro em booleano)    │
+│ lambda *a, **k: -1   │ Negativo / sentinela                │
+│ lambda *a, **k: None │ Nulo (testa segurança contra None)  │
+│ lambda *a, **k: ""   │ String vazia (segurança de strings) │
+│ lambda *a, **k: []   │ Lista vazia (segurança de coleções) │
+│ lambda *a, **k: 2**31-1  │ MAX_INT (limite 32-bit)         │
+│ lambda *a, **k: -(2**31) │ MIN_INT (limite 32-bit)         │
+└──────────────────────┴──────────────────────────────────────┘
+
+
+4.2.2 Exemplo: Código Original
+───────────────────────────────
+
+    import os
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.master('local[*]').appName("Iniciando com Spark").getOrCreate()
+
+    from pyspark.sql.functions import *
+    from pyspark.sql.window import Window
+
+    def mtr_function(df):
+        return (
+            df.withColumn(
+                "trip_duration_min",
+                (unix_timestamp(col("tpep_dropoff_datetime")) -
+                 unix_timestamp(col("tpep_pickup_datetime"))) / 60
+            )
+            .withColumn(
+                "valor_calculado",
+                coalesce(col("fare_amount"), lit(0.0)) +
+                coalesce(col("extra"), lit(0.0)) +
+                coalesce(col("mta_tax"), lit(0.0)) +
+                coalesce(col("tip_amount"), lit(0.0)) +
+                coalesce(col("tolls_amount"), lit(0.0)) +
+                coalesce(col("improvement_surcharge"), lit(0.0)) +
+                coalesce(col("congestion_surcharge"), lit(0.0)) +
+                coalesce(col("airport_fee"), lit(0.0))
+            )
+            .withColumn(
+                "valor_por_km",
+                when(
+                    col("trip_distance") > 0,
+                    col("fare_amount") / col("trip_distance")
+                ).otherwise(lit(None))
+            )
+        )
+
+
+4.2.3 Exemplo: Mutantes Gerados por MTR
+─────────────────────────────────────────
+
+MUTANTE 1 (withColumn "trip_duration_min" → zero):
+
+    def mtr_function(df):
+        return (
+            df.withColumn(
+                "trip_duration_min",
+                lambda *a, **k: 0          # ← MUTAÇÃO
+            )
+            .withColumn(
+                "valor_calculado",
+                coalesce(col("fare_amount"), lit(0.0)) + ...
+            )
+            ...
+        )
+
+
+MUTANTE 2 (withColumn "trip_duration_min" → one):
+
+    def mtr_function(df):
+        return (
+            df.withColumn(
+                "trip_duration_min",
+                lambda *a, **k: 1          # ← MUTAÇÃO
+            )
+            ...
+        )
+
+
+MUTANTE 3 (withColumn "trip_duration_min" → none):
+
+    def mtr_function(df):
+        return (
+            df.withColumn(
+                "trip_duration_min",
+                lambda *a, **k: None       # ← MUTAÇÃO
+            )
+            ...
+        )
+
+
+MUTANTE 4 (withColumn "valor_calculado" → empty_list):
+
+    def mtr_function(df):
+        return (
+            df.withColumn(
+                "trip_duration_min",
+                (unix_timestamp(col("tpep_dropoff_datetime")) -
+                 unix_timestamp(col("tpep_pickup_datetime"))) / 60
+            )
+            .withColumn(
+                "valor_calculado",
+                lambda *a, **k: []         # ← MUTAÇÃO
+            )
+            ...
+        )
+
+
+MUTANTE 5 (withColumn "valor_por_km" → max_int):
+
+    def mtr_function(df):
+        return (
+            ...
+            .withColumn(
+                "valor_por_km",
+                lambda *a, **k: 2**31 - 1  # ← MUTAÇÃO
+            )
+        )
+
+
+ESTRUTURA DE DIRETÓRIOS CRIADA:
+
+    mutants/
+    ├── mtr_1_withColumn_zero/
+    │   └── mtr.py
+    ├── mtr_2_withColumn_one/
+    │   └── mtr.py
+    ├── mtr_3_withColumn_none/
+    │   └── mtr.py
+    ├── mtr_4_withColumn_empty_list/
+    │   └── mtr.py
+    ├── mtr_5_withColumn_max_int/
+    │   └── mtr.py
+    ... (potencialmente até 8 mutantes por .withColumn())
+
+
+4.2.4 Detalhes Técnicos de MTR
+───────────────────────────────
+
+CASO ESPECIAL - withColumn:
+
+Para .withColumn(col_name, expression), a função reside no segundo argumento
+(índice 1), enquanto para outros métodos habita o primeiro (índice 0):
+
+    func_arg_idx = 1 if method_name == "withColumn" else 0
+
+
+CONSTRUÇÃO DE LAMBDAS AST:
+
+O operador constrói lambdas que aceitam *args/**kwargs para máxima flexibilidade:
+
+    def _lambda_returning(value_node: ast.expr) -> ast.Lambda:
+        return ast.Lambda(
+            args=ast.arguments(
+                posonlyargs=[],
+                args=[],
+                vararg=ast.arg(arg="a"),      # *a
+                kwonlyargs=[],
+                kw_defaults=[],
+                kwarg=ast.arg(arg="k"),       # **k
+                defaults=[]
+            ),
+            body=value_node,                   # retorna value_node
+        )
+
+
+PSEUDOCÓDIGO DO ALGORITMO:
+
+    _REPLACEMENTS = [
+        ("zero", ast.Constant(0)),
+        ("one", ast.Constant(1)),
+        ("neg_one", ast.Constant(-1)),
+        ("none", ast.Constant(None)),
+        ("empty_str", ast.Constant("")),
+        ("empty_list", ast.List([])),
+        ("max_int", 2**31 - 1),
+        ("min_int", -(2**31))
+    ]
+
+    def build_mutant(nodes, original_ast, ...):
+        for call_node in nodes:
+            method_name = call_node.func.attr
+            func_arg_idx = 1 if method_name == "withColumn" else 0
+
+            for label, replacement_value in _REPLACEMENTS:
+                tree_copy = deepcopy(original_ast)
+
+                # Localize node em copy via walk order
+                target_in_copy = copied_nodes[node_idx]
+
+                # Splice lambda replacement
+                replacement = _lambda_returning(copy(replacement_value))
+                target_in_copy.args[func_arg_idx] = replacement
+
+                # Unparse e escrever
+                mutant_source = unparse(tree_copy)
+                write_to_disk(mutant_source)
+                record_mutant(Mutant(...))
+
+
+================================================================================
+5. PADRÕES DE DESIGN EMPREGADOS
+================================================================================
+
+5.1 Padrão Strategy
+────────────────────
+
+Implementado através da classe abstrata `Operator` com subclasses concretas.
+Benefícios:
+• Encapsula diferentes estratégias de mutação
+• Permite trocar estratégias em tempo de execução
+• Adiciona novos operadores sem modificar código existente (Open/Closed)
+
+
+5.2 Padrão Registry
+─────────────────────
+
+OPERATOR_REGISTRY mapeia strings para módulos:
+
+    OPERATOR_REGISTRY = {
+        "NFTP": "src.operators.operator_nftp.OperatorNFTP",
+        "MTR": "src.operators.operator_mtr.OperatorMTR",
+    }
+
+Benefícios:
+• Registro dinâmico de operadores
+• Carregamento lazy via importlib
+• Desacoplamento entre componentes
+
+
+5.3 Padrão Orchestrator
+─────────────────────────
+
+MutationManager coordena Operator, TestRunner e Reporter através de fluxo
+bem definido:
+
+    load() → parse_to_ast() → apply_mutation() → run_tests() → agregate_results()
+
+
+5.4 Padrão Data Transfer Object (DTO)
+───────────────────────────────────────
+
+Classes @dataclass com validação em __post_init__:
+
+    @dataclass
+    class Mutant:
+        id: int
+        operator: str
+        original_path: str
+        mutant_path: str
+        modified_line: str
+
+    @dataclass
+    class TestResult:
+        mutant: Mutant
+        status: str
+        failed_tests: list[str]
+        execution_time: float
+
+Benefícios:
+• Type checking automático
+• Representação clara de contratos de dados
+• __repr__ automático para debugging
+
+
+5.5 Padrão Factory com Injeção de Dependência
+───────────────────────────────────────────────
+
+Carregamento dinâmico de operadores:
+
+    def _load_operator(self, op_name):
+        dotted_path = OPERATOR_REGISTRY[op_name]
+        module_path, class_name = dotted_path.rsplit(".", 1)
+        module = importlib.import_module(module_path)
+        operator_class = getattr(module, class_name)
+        return operator_class()
+
+
+================================================================================
+6. INVARIANTES ARQUITETURAIS
+================================================================================
+
+6.1 Imutabilidade da AST Original
+───────────────────────────────────
+
+A AST original NUNCA é mutada in-place. Cada operação trabalha sobre deep-copy:
+
+    tree_copy = copy.deepcopy(original_ast)  # Cópia fresca
+    # ... aplicar mutações em tree_copy
+    mutant_source = ast.unparse(tree_copy)    # Unparse da cópia
+
+Rationale: Evita efeitos colaterais entre mutantes, garante independência
+
+
+6.2 Isolamento de Testes
+──────────────────────────
+
+Cada teste executa em subprocess separado com PYTHONPATH customizado:
+
+    env["PYTHONPATH"] = os.pathsep.join([mutant_dir, ...])
+    proc = subprocess.run([pytest, ...], env=env, timeout=120)
+
+Rationale: Evita cache de importações, simula ambiente real, detecta side effects
+
+
+6.3 Rastreabilidade Completa
+──────────────────────────────
+
+Cada entidade mantém metadata:
+
+    Mutant:
+        id                  # Identificador numérico
+        operator            # Qual operador gerou
+        original_path       # Arquivo original
+        mutant_path         # Onde foi salvo
+        modified_line       # Qual linha foi modificada
+
+    TestResult:
+        mutant              # Referência ao Mutant
+        status              # killed, survived, timeout, error
+        failed_tests        # Testes que falharam
+        execution_time      # Tempo de execução
+
+Rationale: Permite auditoria completa, facilita debugging e análise
+
+
+================================================================================
+7. CONSIDERAÇÕES TÉCNICAS
+================================================================================
+
+7.1 Paralelismo
+─────────────────
+
+• Utiliza ThreadPoolExecutor com max_workers = min(4, cpu_count())
+• Limite evita contenção com SparkSession potencialmente ativa
+• Mantém overhead de memória controlado
+• Bem-suited para I/O-bound tasks (subprocess)
+
+
+7.2 Timeout
+─────────────
+
+• Cada mutante tem timeout de 120 segundos
+• Previne travamentos de testes problemáticos
+• Mutantes que excedem timeout são registrados como "timeout"
+
+
+7.3 Validação em Múltiplos Níveis
+───────────────────────────────────
+
+Operadores validam invariantes em __post_init__:
+
+    • id: inteiro não-negativo
+    • name: string não-vazia (normalizada para maiúsculas)
+    • mutant_registers: string ou lista não-vazia
+    • mutant_list: lista de instâncias Mutant
+
+TestRunner valida entradas:
+
+    • nodes: lista de ast.AST
+    • paths: strings não-vazias
+    • testes: executáveis por pytest
+
+
+7.4 Tratamento de Erros
+────────────────────────
+
+• Validação de entrada com assertions
+• Logging detalhado em cada etapa
+• Erros não interrompem processamento de múltiplos mutantes
+• Resultados são agregados mesmo com falhas parciais
+
+
+================================================================================
+8. FLUXO DE EXECUÇÃO DETALHADO
+================================================================================
+
+8.1 Phase 1: Carregamento
+──────────────────────────
+
+    [config.txt]
+           ↓
+    ConfigLoader.load()
+           ↓
+    Valida chaves obrigatórias:
+    • program_path: caminho do arquivo .py principal
+    • tests_path: diretório com testes pytest
+    • operators_list: lista de operadores (NFTP, MTR)
+           ↓
+    MutationManager.config ← ConfigLoader
+
+
+8.2 Phase 2: Parsing
+──────────────────────
+
+    [programa.py]
+           ↓
+    ast.parse(source_code)
+           ↓
+    ast.fix_missing_locations()
+           ↓
+    MutationManager.program_ast ← ast.Module
+
+
+8.3 Phase 3: Análise e Geração de Mutantes
+─────────────────────────────────────────────
+
+    Para cada operador em operators_list:
+
+        operator.analyse_ast(program_ast)
+                ↓
+        Retorna nodes elegíveis
+                ↓
+        operator.build_mutant(nodes, program_ast, ...)
+                ↓
+        Para cada node:
+            Deep-copy AST original
+            Localizar node em cópia
+            Aplicar mutação
+            Unparse para código-fonte
+            Escrever em disk
+            Registrar em mutant_list
+                ↓
+        Retorna lista de Mutants gerados
+
+
+8.4 Phase 4: Execução de Testes
+─────────────────────────────────
+
+    TestRunner.run_test():
+        ↓
+        ThreadPoolExecutor com 4 workers
+        ↓
+        Para cada Mutant em paralelo:
+            subprocess.run(pytest com PYTHONPATH customizado)
+                ↓
+            Classifica resultado:
+            • code 0 → survived
+            • code 1 → killed
+            • code 2-5 → error
+            • TimeoutExpired → timeout
+                ↓
+            Extrai testes falhados do stdout
+                ↓
+            Retorna TestResult
+
+
+8.5 Phase 5: Agregação e Relatório
+────────────────────────────────────
+
+    Reporter.calculate():
+        Mutation Score = killed / (killed + survived + timeout + error)
+                ↓
+    Reporter.make_diff():
+        difflib.unified_diff(original, mutant)
+        Para cada Mutant
+                ↓
+    Reporter.show_results():
+        Gera HTML com:
+        • Summary Cards
+        • Tabela de Resultados
+        • Diffs expansíveis
+        • JSON estruturado
+
+
+================================================================================
+9. ESTRUTURA DE DIRETÓRIOS PARA MUTANTES
+================================================================================
+
+Os mutantes gerados seguem uma estrutura hierárquica que permite:
+• Rastreabilidade: nomes identificam operador e linha
+• Isolamento: cada mutante em subdiretório próprio
+• Importabilidade: estrutura permite injetar mutante via PYTHONPATH
+
+Exemplo com NFTP:
+
+    mutants/
+    ├── nftp_1_filter_line10/
+    │   └── nftp.py           # Mutante 1 gerado por NFTP
+    ├── nftp_2_filter_line11/
+    │   └── nftp.py           # Mutante 2 gerado por NFTP
+    ├── nftp_3_filter_line12/
+    │   └── nftp.py           # Mutante 3 gerado por NFTP
+    └── nftp_4_where_line15/
+        └── nftp.py           # Mutante 4 gerado por NFTP
+
+
+Exemplo com MTR:
+
+    mutants/
+    ├── mtr_1_map_zero/
+    │   └── mtr.py            # Mutante com replacement 'zero'
+    ├── mtr_2_map_one/
+    │   └── mtr.py            # Mutante com replacement 'one'
+    ├── mtr_3_withColumn_none/
+    │   └── mtr.py            # withColumn → lambda *a, **k: None
+    └── mtr_4_foreach_empty_list/
+        └── mtr.py            # foreach → lambda *a, **k: []
+
+
+Padrão de nomenclatura:
+    {operador}_{id}_{metodo}_{parametro_ou_lineno}/
+    └── {operador}.py
+
+
+================================================================================
+10. EXTENSIBILIDADE
+================================================================================
+
+10.1 Adição de Novos Operadores
+─────────────────────────────────
+
+Para adicionar novo operador:
+
+1. Criar classe herdando de Operator:
+
+    class OperatorNOVO(Operator):
+        def __init__(self):
+            super().__init__(
+                id=3,
+                name="NOVO",
+                mutant_registers=["alvo"]
+            )
+
+        def analyse_ast(self, tree: ast.AST) -> list[ast.AST]:
+            # Implementar lógica de busca
+            pass
+
+        def build_mutant(self, nodes, original_ast, original_path,
+                        mutant_dir) -> list[Mutant]:
+            # Implementar lógica de geração
+            pass
+
+2. Registrar em OPERATOR_REGISTRY:
+
+    OPERATOR_REGISTRY = {
+        "NFTP": "src.operators.operator_nftp.OperatorNFTP",
+        "MTR": "src.operators.operator_mtr.OperatorMTR",
+        "NOVO": "src.operators.operator_novo.OperatorNOVO",  # ← NOVO
+    }
+
+3. Referenciar na configuração:
+
+    operators_list = NFTP, MTR, NOVO
+
+
+10.2 Customização de Comportamento
+────────────────────────────────────
+
+Substituições em MTR:
+
+A lista _REPLACEMENTS pode ser estendida com novos valores de limite:
+
+    _REPLACEMENTS: list[tuple[str, ast.expr]] = [
+        ("zero", ast.Constant(value=0)),
+        ("one", ast.Constant(value=1)),
+        # ... adicionar novas substituições
+        ("custom", ast.Constant(value=999)),
+    ]
+
+
+Métodos alvo em MTR:
+
+Customizar mutant_registers permite focar em métodos específicos:
+
+    operator = OperatorMTR(
+        mutant_registers=["map", "flatMap"]  # Apenas RDD
+    )
+
+
+================================================================================
+11. TECNOLOGIAS E DEPENDÊNCIAS
+================================================================================
+
+11.1 Python Core (Built-in)
+─────────────────────────────
+
+• ast: Parsing e manipulação de árvores sintáticas
+• subprocess: Execução de pytest em subprocessos isolados
+• concurrent.futures: Paralelismo com ThreadPoolExecutor
+• pathlib: Manipulação de caminhos (multiplataforma)
+• dataclasses: DTOs com validação automática
+• importlib: Carregamento dinâmico de módulos
+• difflib: Geração de unified diffs
+• json: Serialização de resultados
+• logging: Rastreamento de execução
+• copy: Deep-copy de AST e estruturas
+
+
+11.2 Dependências Externas
+────────────────────────────
+
+• pytest: Framework de testes (executado em subprocessos)
+• PySpark: Framework de processamento paralelo (alvo de teste, não dependência)
+
+
+================================================================================
+12. LIMITAÇÕES E MELHORIAS FUTURAS
+================================================================================
+
+12.1 Limitações Atuais
+───────────────────────
+
+1. Suporte a Linguagem:
+   Atualmente opera apenas em Python (PySpark). Extensão para Scala/Java seria
+   complexa devido diferenças sintáticas.
+
+2. Granularidade de Mutação:
+   Limitada ao nível de subcondições (NFTP) e funções (MTR). Operadores
+   de substituição aritmética (AOR) não estão implementados.
+
+3. Detecção de Mutantes Equivalentes:
+   Não detecta automaticamente mutantes que mantêm semântica idêntica. Requer
+   análise adicional.
+
+4. Customização de Escopo de Testes:
+   Presume toda suite de testes é relevante. Não suporta filtros por função.
+
+
+12.2 Extensões Potenciais
+──────────────────────────
+
+1. Novos Operadores:
+   • AOR (Arithmetic Operator Replacement): +, -, *, /, %
+   • ROR (Relational Operator Replacement): <, >, <=, >=, ==, !=
+   • COR (Conditional Operator Replacement): and, or, not
+   • SOR (String Operator Replacement): concat, slice, etc
+
+2. Machine Learning:
+   • Priorizar mutantes por probabilidade de sobreviverem
+   • Predição de testes mais efetivos
+
+3. Integração CI/CD:
+   • Webhooks para GitHub/GitLab
+   • Relatórios em Pull Requests
+   • Badge de mutation score
+
+4. Otimização de Execução:
+   • Caching de resultados de execuções anteriores
+   • Análise incremental (apenas código modificado)
+   • Ordem inteligente de execução (testes mais propensos primeiro)
+
+
+================================================================================
+13. CONCLUSÃO
+================================================================================
+
+A ferramenta TransmutPyspark demonstra uma abordagem robusta e bem-arquitetada
+para teste de mutação em aplicações PySpark. Através de seu design modular em
+camadas, implementação clara de padrões de design consolidados, e validações
+em múltiplos níveis, oferece uma base sólida para pesquisa em avaliação de
+qualidade de testes.
+
+A implementação dos dois operadores (NFTP e MTR) cobre cenários críticos em
+pipelines de dados: validação de predicados em operações de filtragem e
+robustez de transformações. O suporte a extensibilidade através do padrão
+Strategy e Registry permite evolução da ferramenta sem modificação do código
+core.
+
+A abordagem baseada em AST, combinada com isolamento completo de execução
+via subprocessos, fornece confiabilidade e fidelidade aos testes reais em
+produção. Os invariantes arquiteturais garantem independência entre mutantes
+e rastreabilidade completa de todas as operações.
+
+TransmutPyspark representa uma ferramenta pronta para produção, adequada tanto
+para pesquisa acadêmica quanto para validação de qualidade em pipelines reais
+de processamento de dados.
+
+
+================================================================================
+FIM DO CAPÍTULO
+================================================================================

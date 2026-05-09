@@ -1,0 +1,213 @@
+================================================================================
+                   OPERADORES ATR E UTS - SUBSEÇÕES PARA TCC
+================================================================================
+
+4.6 O OPERADOR ATR: SUBSTITUIÇÃO DE TRANSFORMAÇÕES DE AGREGAÇÃO
+
+O operador ATR (Aggregation Transformation Replacement) foi desenvolvido para testar
+a robustez de operações de agregação, que são críticas em pipelines de processamento
+de dados. Operações como `.reduce()` e `.reduceByKey()` são fundamentais para combinar
+múltiplos valores em um único resultado através de uma função de agregação fornecida.
+Um erro sutil em uma função de agregação pode produzir resultados incorretos de forma
+silenciosa, corrompendo dados ou cálculos subsequentes.
+
+A estratégia de ATR gera três mutantes por cada operação de agregação elegível,
+cada um representando uma falha plausível em uma função de agregação. O primeiro
+mutante substitui a função original por uma lambda que retorna apenas o primeiro
+parâmetro, descartando completamente o segundo. O segundo mutante faz o oposto,
+retornando apenas o segundo parâmetro. O terceiro mutante mantém a lógica original
+mas inverte a ordem dos parâmetros, testando se a operação de agregação é comutativa.
+
+A intuição por trás dessa estratégia é múltipla. O mutante "return first" testa se
+o teste valida que ambos os elementos estão sendo considerados na agregação. Se o
+teste passa quando apenas o primeiro elemento é retornado, então não está validando
+que o segundo elemento é levado em conta. O mutante "return second" testa o aspecto
+complementar. O mutante "swap params" é particularmente perspicaz - muitas operações
+de agregação, como adição ou multiplicação, são operações matemáticas comutativas onde
+a ordem não importa. Porém, em outras operações, como subtração ou divisão, a ordem
+é crítica. Se a agregação não valida explicitamente a ordem dos operandos, pode estar
+vulnerável a bugs sutis.
+
+Para concretizar, considere um programa PySpark que calcula um agregado:
+
+    rdd = sc.parallelize([1, 2, 3, 4, 5])
+    result = rdd.reduce(lambda a, b: a + b)  # Resultado esperado: 15
+
+O operador ATR geraria três mutantes:
+
+Primeiro mutante (return first):
+
+    result = rdd.reduce(lambda a, b: a)  # Retorna sempre o primeiro elemento
+
+Se o teste não falhar com este mutante, significa que o teste não está validando
+que todos os elementos são agregados. O resultado seria 1 (apenas o primeiro elemento),
+dramaticamente diferente de 15, portanto qualquer teste com dados reais deveria falhar.
+
+Segundo mutante (return second):
+
+    result = rdd.reduce(lambda a, b: b)  # Retorna sempre o segundo elemento
+
+Este mutante testaria se o teste valida o processamento adequado do segundo operando.
+
+Terceiro mutante (swap params):
+
+    result = rdd.reduce(lambda b, a: a + b)  # Parâmetros trocados
+
+Para adição isto produz o mesmo resultado (15), mas testa se o código depende
+acidentalmente da ordem específica dos argumentos. Em operações não-comutativas,
+este mutante exporia imediatamente falhas de teste.
+
+Um exemplo mais complexo ilustra melhor o valor dessa estratégia. Considere um programa
+que calcula o máximo entre múltiplos números:
+
+    rdd = sc.parallelize([5, 2, 8, 1, 9])
+    result = rdd.reduce(lambda a, b: a if a > b else b)  # Resultado esperado: 9
+
+O mutante "swap params" produziria:
+
+    result = rdd.reduce(lambda b, a: a if a > b else b)
+
+Embora matematicamente equivalente para esta operação específica, demonstra que o teste
+valida o comportamento de comparação em ambas as direções. Um mutante "return first"
+produziria 5 em vez de 9, uma mudança semântica drástica que qualquer teste adequado
+deveria detectar.
+
+Do ponto de vista técnico, ATR implementa validação rigorosa da função de agregação
+antes de gerar mutantes. A função deve ser uma lambda com exatamente dois parâmetros
+e sem *args, **kwargs ou argumentos de palavra-chave. Chamadas cujo primeiro argumento
+não satisfaz esta validação são ignoradas com logging, evitando gerar mutantes
+inválidos que produziriam erros sintáticos.
+
+O operador utiliza a mesma técnica de relocalização por coordenadas (lineno, col_offset)
+implementada pelo NFTP, garantindo que cada mutante seja gerado a partir de uma
+deep-copy isolada da AST original. A nomenclatura dos diretórios de mutantes segue
+o padrão `atr_<id>_<metodo>_line<lineno>_<variante>`, facilitando rastreamento de
+qual variante foi aplicada.
+
+A construção de lambdas mutantes é cuidadosamente implementada. Para os mutantes
+"return first" e "return second", uma nova lambda é construída que mantém os
+parâmetros originais mas substitui o corpo por um simples `ast.Name` referenciando
+o primeiro ou segundo parâmetro. Para o mutante "swap params", a abordagem é mais
+sofisticada: a lambda original é deep-copied e então os nomes dos dois argumentos
+são trocados em sua posição, enquanto todo o resto da estrutura permanece intacto.
+Isto garante que o corpo original seja interpretado com argumentos em ordem reversa,
+testando efetivamente a comutatividade.
+
+
+4.7 O OPERADOR UTS: TROCA DE TRANSFORMAÇÕES UNÁRIAS
+
+O operador UTS (Unary Transformations Swap) aborda um cenário fundamentalmente diferente:
+a ordem de operações em cadeias de transformações. Em pipelines PySpark, é comum ver
+código que encadeia múltiplas operações consecutivas:
+
+    result = df.filter(col("age") > 18).select("name", "age")
+
+O UTS reconhece que a ordem destas operações pode importar significativamente para o
+resultado final. Uma transformação unária é uma operação que recebe um único DataFrame
+ou RDD como entrada e produz um único DataFrame ou RDD modificado como saída. Exemplos
+incluem `filter`, `map`, `select`, `distinct`, `orderBy`, e muitas outras.
+
+A estratégia de UTS é simples mas poderosa: para cada par adjacente de transformações
+unárias em uma cadeia de método, gera um mutante no qual as duas transformações são
+executadas em ordem inversa. Assim, um código que filtra primeiro e depois projeta
+colunas é mutado para projetar colunas primeiro e depois filtrar. Se a suite de testes
+passa para ambas as ordens, isso sugere que ou os testes não validam adequadamente o
+comportamento esperado, ou as transformações são verdadeiramente comutativas naquele
+contexto específico.
+
+A motivação para essa estratégia é que em muitos casos, a ordem de transformações não
+deveria importar semanticamente. Por exemplo, filtrar e depois projetar colunas deveria
+produzir o mesmo resultado que projetar e depois filtrar - ambas operações eliminarão
+certos registros ou colunas conforme apropriado. Porém, se o código depende implicitamente
+de uma ordem específica, ou se há bugs lurking que fazem com que a ordem importe quando
+não deveria, os testes deveriam detectar isto.
+
+Em outros cenários, porém, a ordem é criticamente importante e uma troca causaria falha
+legítima. Por exemplo, se uma coluna é selecionada antes de ser criada, a operação
+falhará. O UTS gera esses mutantes de propósito - eles representam bugs muito óbvios
+que qualquer teste deveria detectar.
+
+Para ilustrar, considere um programa PySpark que processa um dataset:
+
+    df_filtered = df.filter(col("salary") > 50000).select("name", "salary", "department")
+
+O operador UTS geraria um mutante:
+
+    df_filtered = df.select("name", "salary", "department").filter(col("salary") > 50000)
+
+Em muitos casos, ambos produzem o mesmo resultado - a seleção de colunas não afeta
+o predicado de filtragem, portanto os testes deveriam passar. Se os testes não passarem,
+isto sugere que o teste estava inadvertidamente dependente de uma ordem que não é
+realmente semanticamente necessária.
+
+Considere um exemplo mais complexo que revela mais sobre o poder dessa estratégia:
+
+    result = (
+        df.filter(col("age") > 18)
+        .select("name", "age", "salary")
+        .filter(col("salary") > 100000)
+    )
+
+Aqui, o UTS identificaria duas operações de filtragem e uma operação de select no meio.
+Ele geraria múltiplos mutantes, incluindo um que inverte as duas operações de filtro
+externas. Dependendo de como os índices são utilizados, isto poderia alterar drasticamente
+o comportamento.
+
+Um exemplo onde a troca causaria claramente erro:
+
+    result = df.filter(col("created_date").isNotNull()).select("id", "name", "created_date")
+
+Se mutado para:
+
+    result = df.select("id", "name", "created_date").filter(col("created_date").isNotNull())
+
+Ainda funciona - a ordem não importa aqui. Mas se o código original fosse:
+
+    result = df.withColumn("age", year(current_date()) - year(col("birth_date")))\
+               .filter(col("age") > 18).select("id", "name", "age")
+
+E fosse mutado para:
+
+    result = df.filter(col("age") > 18)\
+               .withColumn("age", year(current_date()) - year(col("birth_date")))\
+               .select("id", "name", "age")
+
+Isto falharia claramente, pois a coluna "age" não existe ainda quando o filtro é aplicado.
+
+O UTS mantém um registro de transformações unárias reconhecidas:
+
+    filter, where, select, drop, distinct, dropDuplicates, limit, orderBy, sort,
+    cache, persist, map, flatMap, sortBy
+
+Qualquer par adjacente destas transformações em uma cadeia de método é considerado
+elegível para troca. Importante notar que nenhuma restrição é aplicada quanto a grupos
+- um `filter` pode ser trocado com um `map`, mesmo que semanticamente isto seja duvidoso.
+A razão para esta decisão de design é pragmática: tais trocas semanticamente inválidas
+simplesmente falharão ao executar, gerando uma exceção que o teste deveria capturar.
+Se o teste não captura uma troca obviamente inválida, isto indica um teste inadequado.
+
+Tecnicamente, o UTS utiliza manipulação sofisticada de AST para realizar a troca. O
+operador identifica um par de chamadas aninhadas (onde a chamada externa tem como
+receptor a chamada interna) e então executa uma reescrita elegante. A chamada externa
+é reescrita para carregar o nome do método interno e seus argumentos, enquanto a
+chamada interna é reescrita para carregar o nome do método externo e seus argumentos.
+O receptor base (o DataFrame ou RDD sobre o qual as operações são aplicadas) é
+preservado. Esta abordagem evita manipulação complexa de ponteiros para pais, resultando
+em código limpo e confiável.
+
+A estrutura de diretórios para mutantes UTS segue o padrão `uts_<id>_<outer>_<inner>_line<lineno>`,
+claramente indicando quais transformações foram trocadas e em qual linha ocorreu a troca
+original. Isto facilita a investigação posterior e o debugging quando anomalias são observadas.
+
+Um aspecto particularmente valioso do UTS é sua capacidade de revelar presunções implícitas
+sobre ordem de operações que desenvolvedores podem estar fazendo. Muitas vezes, um
+programador escreve código em uma ordem específica sem considerar conscientemente se
+outra ordem seria semanticamente equivalente. Ao gerar mutantes com trocas de ordem,
+o UTS força a suite de testes a validar se essas presunções estão corretas. Se os testes
+assumem uma ordem específica sem razão válida, eles falharão - indicando uma falha no
+teste ou uma dependência implícita que deveria ser explicada ou testada mais rigorosamente.
+
+
+================================================================================
+FIM DAS SUBSEÇÕES
+================================================================================

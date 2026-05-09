@@ -33,7 +33,8 @@ from unittest.mock import MagicMock, patch, PropertyMock, call
 
 import pytest
 
-from code.test_runner import TestResult, TestRunner
+from src.model.test_result import TestResult
+from src.test_module.test_runner import TestRunner
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #

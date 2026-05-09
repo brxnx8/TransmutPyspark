@@ -33,8 +33,8 @@ Test groups
 import ast
 import pytest
 
-from src.operator import Operator
-from src.mutant import Mutant
+from src.operators.operator import Operator
+from src.model.mutant import Mutant
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
