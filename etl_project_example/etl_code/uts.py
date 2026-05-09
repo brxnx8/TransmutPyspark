@@ -1,11 +1,3 @@
-import os
-from pyspark.sql import SparkSession
-
-spark = (SparkSession.builder
-    .master("local[*]")
-    .appName("UTS Source")
-    .getOrCreate())
-
 # Importe das libs e funções necessarias
 from pyspark.sql.functions import col, lit
 

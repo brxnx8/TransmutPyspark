@@ -14,6 +14,7 @@ Mudanças em relação à versão anterior:
 import importlib
 import logging
 import shutil
+import time
 from pathlib import Path
 
 from src.config.config_loader import ConfigLoader
@@ -63,8 +64,8 @@ class MutationManager:
         # Prepara workdir
         self.work_dir = self.config.workspace_dir / _OUTPUT_DIR_NAME
         if self.work_dir.exists():
-            shutil.rmtree(self.work_dir)
-        self.work_dir.mkdir(parents=True)
+            self._safe_rmtree(self.work_dir)
+        self.work_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Workdir criado: {self.work_dir}")
 
         # Lê código de todos os arquivos fonte
@@ -236,6 +237,22 @@ class MutationManager:
         module_path, class_name = dotted_path.rsplit(".", 1)
         module = importlib.import_module(module_path)
         return getattr(module, class_name).create()
+
+    def _safe_rmtree(self, path: Path, max_retries: int = 3, delay: float = 0.2) -> None:
+        if not path.exists():
+            return
+        for attempt in range(max_retries):
+            try:
+                shutil.rmtree(path)
+                return
+            except PermissionError:
+                if attempt < max_retries - 1:
+                    logger.debug(f"Retrying directory removal (attempt {attempt + 1}/{max_retries}): {path}")
+                    time.sleep(delay)
+                else:
+                    logger.warning(f"Permission denied after {max_retries} attempts, using ignore_errors=True: {path}")
+                    shutil.rmtree(path, ignore_errors=True)
+                    return
 
     def __repr__(self) -> str:
         return (

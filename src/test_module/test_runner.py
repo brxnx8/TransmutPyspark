@@ -136,12 +136,14 @@ class TestRunner:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 env=env,
                 timeout=120,
             )
             duration     = time.perf_counter() - start
             status       = self._classify(proc.returncode)
-            failed_tests = self._extract_failed_tests(proc.stdout)
+            failed_tests = self._extract_failed_tests(proc.stdout or "")
 
             logger.debug(
                 f"Mutant {mutant.id}: {status} "

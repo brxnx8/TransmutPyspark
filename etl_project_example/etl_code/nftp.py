@@ -1,7 +1,3 @@
-import os
-from pyspark.sql import SparkSession
-spark = SparkSession.builder.master('local[*]').appName("Iniciando com Spark").getOrCreate()
-"#Importe das libs e funções necessarias"
 from pyspark.sql.functions import *
 from pyspark.sql.window import Window
 

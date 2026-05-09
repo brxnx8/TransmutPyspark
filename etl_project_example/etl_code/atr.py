@@ -1,11 +1,3 @@
-import os
-from pyspark.sql import SparkSession
-
-spark = (SparkSession.builder
-    .master("local[*]")
-    .appName("ATR Example")
-    .getOrCreate())
-
 from pyspark.sql.functions import col, sum, count, avg, max, min, rank, dense_rank
 from pyspark.sql.window import Window
 
