@@ -2,11 +2,6 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql import Window
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-#  SIMPLES 1 – Filtro de corridas válidas com tip_rate calculado              #
-# ─────────────────────────────────────────────────────────────────────────── #
-
 def valid_trips_with_tip_rate(df: DataFrame) -> DataFrame:
     """
     Mantém apenas corridas pagas em dinheiro com distância positiva e
@@ -28,11 +23,6 @@ def valid_trips_with_tip_rate(df: DataFrame) -> DataFrame:
     )
     return df
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-#  SIMPLES 2 – Receita total por fornecedor                                   #
-# ─────────────────────────────────────────────────────────────────────────── #
-
 def revenue_by_vendor(df: DataFrame) -> DataFrame:
     """
     Filtra corridas com valor positivo e agrega receita e contagem
@@ -52,11 +42,6 @@ def revenue_by_vendor(df: DataFrame) -> DataFrame:
     )
     df = df.select("VendorID", "total_revenue", "trip_count")
     return df
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-#  MÉDIO 1 – Perfil de corridas por zona de embarque                          #
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def trip_profile_by_zone(df: DataFrame) -> DataFrame:
     """
@@ -93,11 +78,6 @@ def trip_profile_by_zone(df: DataFrame) -> DataFrame:
     )
     return df
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-#  MÉDIO 2 – Ranking de gorjeta dentro de cada hora do dia                    #
-# ─────────────────────────────────────────────────────────────────────────── #
-
 def tip_ranking_by_hour(df: DataFrame) -> DataFrame:
     """
     Adiciona a hora do dia, descarta gorjetas ausentes ou nulas, e rankeia
@@ -123,5 +103,3 @@ def tip_ranking_by_hour(df: DataFrame) -> DataFrame:
     df = df.where(F.col("tip_rank") <= 3)
     df = df.select("pickup_hour", "tip_amount", "tip_rank", "VendorID")
     return df
-
-

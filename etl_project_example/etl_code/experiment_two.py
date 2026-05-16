@@ -26,14 +26,13 @@ def full_trip_efficiency_analysis(df: DataFrame) -> DataFrame:
            → withColumn("cost_per_mile")  — múltiplos pares sem dependência
            withColumn("shift") → filter de velocidade  (sem dependência)
     """
-    # ── 1. Filtro de sanidade inicial ────────────────────────────────────
+    
     df = df.filter(
         (F.col("fare_amount") > 0.0)
         & (F.col("trip_distance") > 0.0)
         & (F.col("passenger_count") > 0)
     )
 
-    # ── 2. Métricas derivadas ─────────────────────────────────────────────
     df = df.withColumn(
         "trip_duration_min",
         (F.col("tpep_dropoff_datetime").cast("long") - F.col("tpep_pickup_datetime").cast("long")) / 60.0,
@@ -51,7 +50,6 @@ def full_trip_efficiency_analysis(df: DataFrame) -> DataFrame:
         F.col("fare_amount") / F.col("trip_distance"),
     )
 
-    # ── 3. Turno do dia (madrugada / manhã / tarde / noite) ──────────────
     df = df.withColumn(
         "shift",
         F.when(F.hour(F.col("tpep_pickup_datetime")) < 6, "overnight")
@@ -60,7 +58,6 @@ def full_trip_efficiency_analysis(df: DataFrame) -> DataFrame:
          .otherwise("night"),
     )
 
-    # ── 4. Detecção de anomalia por zona (cost_per_mile acima do p95) ────
     zone_stats = df.groupBy("PULocationID").agg(
         F.avg("cost_per_mile").alias("avg_cost_per_mile"),
         F.count("PULocationID").alias("zone_trip_count"),
@@ -77,7 +74,6 @@ def full_trip_efficiency_analysis(df: DataFrame) -> DataFrame:
     )
     df = df.where(F.col("is_anomaly") == 0)
 
-    # ── 5. Ranking de zonas por receita média por milha ──────────────────
     window_rank = Window.orderBy(F.col("avg_cost_per_mile").desc())
     df = df.join(zone_stats, on="PULocationID", how="left")
     df = df.withColumn(
@@ -85,7 +81,6 @@ def full_trip_efficiency_analysis(df: DataFrame) -> DataFrame:
         F.percent_rank().over(window_rank),
     )
 
-    # ── 6. Agregação final por zona e turno ───────────────────────────────
     df = df.groupBy("PULocationID", "shift").agg(
         F.sum("fare_amount").alias("total_fare"),
         F.avg("trip_distance").alias("avg_distance"),
@@ -93,7 +88,6 @@ def full_trip_efficiency_analysis(df: DataFrame) -> DataFrame:
         F.count("PULocationID").alias("trip_count"),
     )
 
-    # ── 7. Projeção final ────────────────────────────────────────────────
     df = df.select(
         "PULocationID",
         "shift",
