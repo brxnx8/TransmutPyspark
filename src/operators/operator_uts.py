@@ -280,25 +280,39 @@ class OperatorUTS(Operator):
             p for p in _find_pairs(original_ast, self.max_distance)
             if _node_key(p.outer) in eligible_node_keys
         ]
+        breakpoint()
 
         for pair in pairs:
-            modified_line = _modified_line_desc(pair)
-
-            mid = self._next_mutant_id()
-            filename = f"UTS_{mid}_{pair.inner_method}_{pair.outer_method}_d{pair.distance}_swap.py"
-
-            mutated_ast = _build_swapped(pair, original_ast)
-            mutant_path = self._write_mutant_file(mutated_ast, mutant_dir, filename)
-
-            mutant = Mutant(
-                id=mid,
-                operator=self.name,
-                original_path=original_path,
-                mutant_path=mutant_path,
-                modified_line=modified_line,
+            self._emit(
+                original_ast,
+                pair,
+                original_path,
+                mutant_dir,
             )
-            self.mutant_list.append(mutant)
-            self._log_mutant_created(mid, f"{modified_line} [{filename}]")
 
         self._log_build_mutant_done()
         return self.mutant_list
+
+    def _emit(
+        self,
+        original_ast: ast.AST,
+        pair: _Pair,
+        original_path: str,
+        mutant_dir: str,
+    ) -> None:
+        modified_line = _modified_line_desc(pair)
+        mid = self._next_mutant_id()
+        filename = f"UTS_{mid}_{pair.inner_method}_{pair.outer_method}_d{pair.distance}_swap.py"
+        mutated_ast = _build_swapped(pair, original_ast)
+        mutant_path = self._write_mutant_file(mutated_ast, mutant_dir, filename)
+
+        mutant = Mutant(
+            id=mid,
+            operator=self.name,
+            original_path=original_path,
+            mutant_path=mutant_path,
+            modified_line=modified_line,
+        )
+
+        self.mutant_list.append(mutant)
+        self._log_mutant_created(mid, f"{modified_line} [{filename}]")
