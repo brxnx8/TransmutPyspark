@@ -280,7 +280,6 @@ class OperatorUTS(Operator):
             p for p in _find_pairs(original_ast, self.max_distance)
             if _node_key(p.outer) in eligible_node_keys
         ]
-        breakpoint()
 
         for pair in pairs:
             self._emit(

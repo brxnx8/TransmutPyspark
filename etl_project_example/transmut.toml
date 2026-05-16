@@ -1,6 +1,6 @@
 [transmut]
 source_dirs   = ["etl_code/"]
 tests_dirs    = ["etl_test/strong_test/"]
-operators     = ["UTS"]
+operators     = ["MTR"]
 workspace_dir = "."
 # exclude = ["src/utils/logging.py"]   # opcional

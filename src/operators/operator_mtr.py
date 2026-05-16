@@ -11,6 +11,7 @@ Alvo (DataFrame API):
 import ast
 import copy
 from dataclasses import dataclass, field
+from typing import cast
 from pathlib import Path
 
 from src.model.mutant import Mutant
@@ -112,7 +113,8 @@ class OperatorMTR(Operator):
         self._assert_valid_path(original_path, "original_path")
         self._assert_valid_path(mutant_dir, "mutant_dir")
 
-        for call_node in nodes:
+        for node in nodes:
+            call_node = cast(ast.Call, node)
             target_exprs = _collect_target_expressions(call_node)
             method = _method_name(call_node) or "unknown"
 
@@ -126,22 +128,41 @@ class OperatorMTR(Operator):
                 substitutes["negated"] = _negate_expr(original_expr)
 
                 for label, replacement in substitutes.items():
-                    mid = self._next_mutant_id()
-                    filename = f"MTR_{mid}_{method}_expr{expr_idx}_{label}.py"
-                    modified_line = _modified_line_desc(call_node, original_expr, label)
-
-                    mutated_ast = self._replace_node(original_ast, original_expr, replacement)
-                    mutant_path = self._write_mutant_file(mutated_ast, mutant_dir, filename)
-
-                    mutant = Mutant(
-                        id=mid,
-                        operator=self.name,
-                        original_path=original_path,
-                        mutant_path=mutant_path,
-                        modified_line=modified_line,
+                    self._emit(
+                        original_ast, call_node, method, expr_idx,
+                        replacement, original_expr, original_path,
+                        mutant_dir, label
                     )
-                    self.mutant_list.append(mutant)
-                    self._log_mutant_created(mid, f"{modified_line} [{filename}]")
+
 
         self._log_build_mutant_done()
         return self.mutant_list
+
+    def _emit(
+        self,
+        original_ast: ast.AST,
+        call_node: ast.Call,
+        method: str,
+        expr_idx: int,
+        replacement: ast.expr,
+        original_expr: ast.expr,
+        original_path: str,
+        mutant_dir: str,
+        label: str,
+    ) -> None:
+        mid = self._next_mutant_id()
+        filename = f"MTR_{mid}_{method}_expr{expr_idx}_{label}.py"
+        modified_line = _modified_line_desc(call_node, original_expr, label)
+
+        mutated_ast = self._replace_node(original_ast, original_expr, replacement)
+        mutant_path = self._write_mutant_file(mutated_ast, mutant_dir, filename)
+
+        mutant = Mutant(
+            id=mid,
+            operator=self.name,
+            original_path=original_path,
+            mutant_path=mutant_path,
+            modified_line=modified_line,
+        )
+        self.mutant_list.append(mutant)
+        self._log_mutant_created(mid, f"{modified_line} [{filename}]")
