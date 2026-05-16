@@ -15,7 +15,7 @@ Mutações:
 import ast
 import copy
 from dataclasses import dataclass, field
-
+from typing import cast
 from src.model.mutant import Mutant
 from src.operators.operator import Operator
 
@@ -134,7 +134,8 @@ class OperatorNFTP(Operator):
         self._assert_valid_path(original_path, "original_path")
         self._assert_valid_path(mutant_dir, "mutant_dir")
 
-        for call_node in nodes:
+        for node in nodes:
+            call_node = cast(ast.Call, node)
             pred = _get_predicate(call_node)
             method = _method_name(call_node) or "unknown"
             line = getattr(pred, "lineno", "?")

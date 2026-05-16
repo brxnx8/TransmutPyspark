@@ -113,7 +113,7 @@ class MutationManager:
 
         mutant_dir    = self.work_dir / "mutants"
         mutant_dir.mkdir(parents=True, exist_ok=True)
-        global_counter = 0
+        # global_counter = 0
 
         for target in self.config.targets:
             file_ast = self.source_asts.get(target.source_file.resolve())
@@ -156,8 +156,8 @@ class MutationManager:
 
                     # Propaga mapeamento de testes para cada mutante gerado
                     for m in new_mutants:
-                        global_counter += 1
-                        m.id             = global_counter
+                        # global_counter += 1
+                        # m.id             = global_counter
                         m.test_files     = list(target.test_files)
                         m.test_functions = list(target.test_functions)
 

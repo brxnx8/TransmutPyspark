@@ -43,6 +43,7 @@ from pathlib import Path
 import copy
 
 from src.model.mutant import Mutant
+from src.model.mutant_id_manager import MutantIDManager
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,8 @@ class Operator(ABC):
     # ------------------------------------------------------------------ #
     # Post-init validation                                                 #
     # ------------------------------------------------------------------ #
+
+    _id_manager = MutantIDManager()
 
     def __post_init__(self) -> None:
         self._validate_id()
@@ -339,8 +342,7 @@ class Operator(ABC):
             )
 
     def _next_mutant_id(self) -> int:
-        """Return the next available mutant id (1-based, sequential)."""
-        return len(self.mutant_list) + 1
+        return self._id_manager.next_id()
 
     # ------------------------------------------------------------------ #
     # Private validators                                                   #

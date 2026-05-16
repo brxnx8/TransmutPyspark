@@ -13,7 +13,7 @@ import ast
 import copy
 from dataclasses import dataclass, field
 from pathlib import Path
-
+from typing import cast
 from src.model.mutant import Mutant
 from src.operators.operator import Operator
 
@@ -125,7 +125,8 @@ class OperatorATR(Operator):
 
         all_strings = _find_string_constants(original_ast)
 
-        for call_node in nodes:
+        for node in nodes:
+            call_node = cast(ast.Call, node)
             mname = _method_name(call_node)
 
             # ── Caso A: .agg(F.sum("col"), ...) ──────────────────────────
