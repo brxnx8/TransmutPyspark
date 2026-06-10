@@ -19,7 +19,7 @@ class TestResult:
 
     def __repr__(self) -> str:
         return (
-            f"ConfigLoader("
+            f"TestResult("
             f"mutant={self.mutant}, "
             f"status={self.status!r}, "
             f"failed_tests={self.failed_tests!r}, "

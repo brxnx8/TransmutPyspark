@@ -1,561 +1,569 @@
-"""
-tests_operator.py
-=================
-Unit tests for ``src.operator.Operator``.
-
-Coverage strategy
------------------
-``Operator`` is an abstract class — it cannot be instantiated directly.
-Every test uses ``ConcreteOperator``, a minimal concrete subclass defined
-at the top of this module, so that the abstract contract is fulfilled while
-keeping the focus on the base-class logic.
-
-Test groups
------------
-1.  Construction — happy path (str / list registers, id=0 edge case)
-2.  _validate_id — non-int, negative, float disguised as int (bool)
-3.  _validate_name — non-str, blank, whitespace-only; normalisation to UPPER
-4.  _validate_mutant_registers (str branch) — empty string, whitespace-only
-5.  _validate_mutant_registers (list branch) — empty list, list with blank
-    strings, list with non-str items, mixed valid/invalid
-6.  _validate_mutant_registers (wrong type branch) — int, None, tuple
-7.  _validate_mutant_list — non-list, list with non-Mutant items
-8.  _assert_valid_tree — non-AST values
-9.  _assert_valid_nodes — non-list, list with non-AST items, mixed list
-10. _assert_valid_path — non-str, empty string, whitespace-only string
-11. _next_mutant_id — empty list → 1, after appending mutants
-12. clear_mutant_list — empties the list, other attributes unchanged
-13. __repr__ — correct format, reflects current mutant count
-14. Abstract enforcement — TypeError when abstract methods not implemented
-15. ABC cannot be instantiated directly
-"""
+from __future__ import annotations
 
 import ast
+import logging
+from pathlib import Path
+from unittest.mock import MagicMock, patch, call
+
 import pytest
 
-from src.operators.operator import Operator
+# ---------------------------------------------------------------------------
+# Ajuste de import path (estrutura src/model/...)
+# ---------------------------------------------------------------------------
+import sys, types
+
+# Cria módulos stub para src.model.mutant e src.model.mutant_id_manager
+# caso o projeto não esteja no PYTHONPATH durante os testes.
+def _ensure_stubs():
+    # src
+    if "src" not in sys.modules:
+        sys.modules["src"] = types.ModuleType("src")
+    # src.model
+    if "src.model" not in sys.modules:
+        mod = types.ModuleType("src.model")
+        sys.modules["src.model"] = mod
+        sys.modules["src"].model = mod  # type: ignore[attr-defined]
+    # src.model.mutant  →  usa a classe real se disponível, senão stub
+    if "src.model.mutant" not in sys.modules:
+        try:
+            from mutant import Mutant  # arquivo local
+        except ImportError:
+            @dataclass_stub
+            class Mutant: ...          # pragma: no cover
+        mod_mutant = types.ModuleType("src.model.mutant")
+        mod_mutant.Mutant = Mutant     # type: ignore[attr-defined]
+        sys.modules["src.model.mutant"] = mod_mutant
+    # src.model.mutant_id_manager  →  usa a classe real se disponível
+    if "src.model.mutant_id_manager" not in sys.modules:
+        try:
+            from mutant_id_manager import MutantIDManager
+        except ImportError:
+            class MutantIDManager:     # pragma: no cover
+                _counter = 0
+                def next_id(self): self._counter += 1; return self._counter
+                def reset(self): self._counter = 0
+        mod_mgr = types.ModuleType("src.model.mutant_id_manager")
+        mod_mgr.MutantIDManager = MutantIDManager  # type: ignore[attr-defined]
+        sys.modules["src.model.mutant_id_manager"] = mod_mgr
+
+_ensure_stubs()
+
+from src.operators.operator import Operator 
 from src.model.mutant import Mutant
+from src.model.mutant_id_manager import MutantIDManager
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# Helpers                                                                      #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-def _make_mutant(id: int = 1) -> Mutant:
-    """Return a minimal valid Mutant instance."""
-    return Mutant(
-        id=id,
-        operator="TEST",
-        original_path="/original/app.py",
-        mutant_path=f"/mutants/m_{id}.py",
-        modified_line="x = 1",
-    )
-
+# ===========================================================================
+# Subclasses concretas para teste
+# ===========================================================================
 
 class ConcreteOperator(Operator):
-    """Minimal concrete subclass used across all tests."""
+    """Implementação mínima — retorna listas vazias."""
+    _DEFAULT_ID        = 0
+    _DEFAULT_NAME      = "CONCRETE"
+    _DEFAULT_REGISTERS = "SomeNode"
 
     def analyse_ast(self, tree: ast.AST) -> list[ast.AST]:
+        self._assert_valid_tree(tree)
         return []
 
     def build_mutant(self, nodes, original_ast, original_path, mutant_dir):
+        self._assert_valid_nodes(nodes)
+        self._assert_valid_path(original_path, "original_path")
+        self._assert_valid_path(mutant_dir,    "mutant_dir")
         return self.mutant_list
 
 
-def make_op(
-    id: int = 1,
-    name: str = "TEST",
-    mutant_registers=None,
-    mutant_list=None,
-) -> ConcreteOperator:
-    """Factory for ConcreteOperator with sensible defaults."""
-    kwargs: dict = {
-        "id": id,
-        "name": name,
-        "mutant_registers": mutant_registers if mutant_registers is not None else "Add",
-    }
-    if mutant_list is not None:
-        kwargs["mutant_list"] = mutant_list
-    return ConcreteOperator(**kwargs)
+class SpyOperator(Operator):
+    """Registra os argumentos recebidos para testes de integração."""
+    _DEFAULT_ID        = 1
+    _DEFAULT_NAME      = "SPY"
+    _DEFAULT_REGISTERS = ["NodeA", "NodeB"]
+
+    def analyse_ast(self, tree: ast.AST) -> list[ast.AST]:
+        self._assert_valid_tree(tree)
+        return list(ast.walk(tree))[:3]   # devolve até 3 nós reais
+
+    def build_mutant(self, nodes, original_ast, original_path, mutant_dir):
+        self._assert_valid_nodes(nodes)
+        self._assert_valid_path(original_path, "original_path")
+        self._assert_valid_path(mutant_dir,    "mutant_dir")
+        return self.mutant_list
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# 1. Construction — happy path                                                 #
-# ─────────────────────────────────────────────────────────────────────────── #
+# ===========================================================================
+# Fixtures
+# ===========================================================================
 
-class TestConstruction:
+@pytest.fixture(autouse=True)
+def reset_id_manager():
+    """Isola o Singleton MutantIDManager entre testes."""
+    MutantIDManager._instance = None
+    MutantIDManager._counter  = 0
+    yield
+    MutantIDManager._instance = None
+    MutantIDManager._counter  = 0
 
-    def test_str_mutant_registers(self):
-        op = make_op(mutant_registers="Add")
-        assert op.mutant_registers == "Add"
 
-    def test_list_mutant_registers(self):
-        op = make_op(mutant_registers=["Add", "Sub", "Mult"])
-        assert op.mutant_registers == ["Add", "Sub", "Mult"]
+@pytest.fixture()
+def op() -> ConcreteOperator:
+    return ConcreteOperator(id=1, name="AOR", mutant_registers="Add")
 
-    def test_name_is_normalised_to_uppercase(self):
-        op = make_op(name="aor")
+
+@pytest.fixture()
+def simple_ast() -> ast.AST:
+    return ast.parse("x = 1 + 2")
+
+
+@pytest.fixture()
+def sample_mutant(tmp_path) -> Mutant:
+    return Mutant(
+        id=1,
+        operator="AOR",
+        original_path=str(tmp_path / "src.py"),
+        mutant_path=str(tmp_path / "mutant_1.py"),
+        modified_line="line 1: Add → Sub",
+    )
+
+
+# ===========================================================================
+# Instanciação e __post_init__
+# ===========================================================================
+
+class TestOperatorInstantiation:
+
+    def test_should_create_instance_with_valid_arguments(self, op):
+        assert op.id == 1
         assert op.name == "AOR"
-
-    def test_name_with_surrounding_whitespace_is_stripped_and_uppercased(self):
-        op = make_op(name="  ror  ")
-        assert op.name == "ROR"
-
-    def test_id_zero_is_valid(self):
-        op = make_op(id=0)
-        assert op.id == 0
-
-    def test_mutant_list_defaults_to_empty(self):
-        op = make_op()
+        assert op.mutant_registers == "Add"
         assert op.mutant_list == []
 
-    def test_mutant_list_accepts_prepopulated_list(self):
-        m = _make_mutant()
-        op = make_op(mutant_list=[m])
-        assert len(op.mutant_list) == 1
+    def test_should_normalize_name_to_uppercase_on_creation(self):
+        o = ConcreteOperator(id=1, name="aor", mutant_registers="Add")
+        assert o.name == "AOR"
 
+    def test_should_strip_whitespace_from_name_on_creation(self):
+        o = ConcreteOperator(id=1, name="  ror  ", mutant_registers="Add")
+        assert o.name == "ROR"
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# 2. _validate_id                                                              #
-# ─────────────────────────────────────────────────────────────────────────── #
+    def test_should_accept_list_for_mutant_registers(self):
+        o = ConcreteOperator(id=1, name="ROR", mutant_registers=["Lt", "Gt"])
+        assert o.mutant_registers == ["Lt", "Gt"]
 
-class TestValidateId:
+    def test_should_accept_zero_as_valid_id(self):
+        o = ConcreteOperator(id=0, name="LCR", mutant_registers="Node")
+        assert o.id == 0
 
-    def test_negative_id_raises_type_error(self):
+    def test_should_initialize_mutant_list_as_empty_by_default(self, op):
+        assert op.mutant_list == []
+
+    def test_should_accept_pre_populated_mutant_list(self, sample_mutant):
+        o = ConcreteOperator(
+            id=1, name="AOR", mutant_registers="Add",
+            mutant_list=[sample_mutant],
+        )
+        assert len(o.mutant_list) == 1
+
+    def test_should_raise_type_error_when_id_is_negative(self):
         with pytest.raises(TypeError, match="non-negative integer"):
-            make_op(id=-1)
+            ConcreteOperator(id=-1, name="AOR", mutant_registers="Add")
 
-    def test_float_id_raises_type_error(self):
+    def test_should_raise_type_error_when_id_is_string(self):
         with pytest.raises(TypeError, match="non-negative integer"):
-            make_op(id=1.0)  # type: ignore[arg-type]
+            ConcreteOperator(id="1", name="AOR", mutant_registers="Add")  # type: ignore
 
-    def test_string_id_raises_type_error(self):
-        with pytest.raises(TypeError, match="non-negative integer"):
-            make_op(id="1")  # type: ignore[arg-type]
-
-    def test_none_id_raises_type_error(self):
-        with pytest.raises(TypeError, match="non-negative integer"):
-            make_op(id=None)  # type: ignore[arg-type]
-
-    def test_bool_true_raises_type_error(self):
-        # bool is a subclass of int in Python; True == 1 — but we document
-        # that only plain int is accepted.  If your validator currently
-        # accepts bool, this test documents that behaviour.  Adjust if the
-        # spec changes.
-        # bool subclasses int → isinstance(True, int) is True AND True >= 0,
-        # so the current implementation accepts it.  We test the actual
-        # observable behaviour rather than an assumption.
-        op = make_op(id=True)   # bool accepted by current impl
-        assert op.id is True
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# 3. _validate_name                                                            #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-class TestValidateName:
-
-    def test_non_string_name_raises_type_error(self):
+    def test_should_raise_type_error_when_name_is_not_string(self):
         with pytest.raises(TypeError, match="non-empty string"):
-            make_op(name=123)  # type: ignore[arg-type]
+            ConcreteOperator(id=1, name=123, mutant_registers="Add")  # type: ignore
 
-    def test_none_name_raises_type_error(self):
+    def test_should_raise_type_error_when_name_is_empty_string(self):
         with pytest.raises(TypeError, match="non-empty string"):
-            make_op(name=None)  # type: ignore[arg-type]
+            ConcreteOperator(id=1, name="", mutant_registers="Add")
 
-    def test_empty_string_name_raises_type_error(self):
+    def test_should_raise_type_error_when_name_is_whitespace_only(self):
         with pytest.raises(TypeError, match="non-empty string"):
-            make_op(name="")
+            ConcreteOperator(id=1, name="   ", mutant_registers="Add")
 
-    def test_whitespace_only_name_raises_type_error(self):
-        with pytest.raises(TypeError, match="non-empty string"):
-            make_op(name="   ")
+    def test_should_raise_value_error_when_mutant_registers_is_empty_string(self):
+        with pytest.raises(ValueError, match="must not be an empty string"):
+            ConcreteOperator(id=1, name="AOR", mutant_registers="")
 
-    def test_name_is_uppercased(self):
-        op = make_op(name="lcr")
-        assert op.name == "LCR"
-
-    def test_name_mixed_case_is_uppercased(self):
-        op = make_op(name="NfTp")
-        assert op.name == "NFTP"
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# 4. _validate_mutant_registers — str branch                                   #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-class TestValidateMutantRegistersStr:
-
-    def test_valid_str_is_accepted(self):
-        op = make_op(mutant_registers="Add")
-        assert op.mutant_registers == "Add"
-
-    def test_empty_string_raises_value_error(self):
-        with pytest.raises(ValueError, match="mutant_registers must not be"):
-            make_op(mutant_registers="")
-
-    def test_whitespace_only_string_raises_value_error(self):
-        with pytest.raises(ValueError, match="mutant_registers must not be"):
-            make_op(mutant_registers="   ")
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# 5. _validate_mutant_registers — list branch                                  #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-class TestValidateMutantRegistersList:
-
-    def test_valid_list_is_accepted(self):
-        op = make_op(mutant_registers=["Add", "Sub"])
-        assert op.mutant_registers == ["Add", "Sub"]
-
-    def test_single_element_list_is_accepted(self):
-        op = make_op(mutant_registers=["filter"])
-        assert op.mutant_registers == ["filter"]
-
-    def test_empty_list_raises_value_error(self):
+    def test_should_raise_value_error_when_mutant_registers_is_empty_list(self):
         with pytest.raises(ValueError, match="must not be empty"):
-            make_op(mutant_registers=[])
+            ConcreteOperator(id=1, name="AOR", mutant_registers=[])
 
-    def test_list_with_empty_string_raises_value_error(self):
+    def test_should_raise_value_error_when_mutant_registers_list_has_empty_string(self):
         with pytest.raises(ValueError, match="non-empty strings"):
-            make_op(mutant_registers=["Add", ""])
+            ConcreteOperator(id=1, name="AOR", mutant_registers=["Lt", ""])
 
-    def test_list_with_whitespace_string_raises_value_error(self):
-        with pytest.raises(ValueError, match="non-empty strings"):
-            make_op(mutant_registers=["Add", "   "])
+    def test_should_raise_type_error_when_mutant_registers_is_wrong_type(self):
+        with pytest.raises(TypeError, match="str or list"):
+            ConcreteOperator(id=1, name="AOR", mutant_registers=42)  # type: ignore
 
-    def test_list_with_non_string_item_raises_value_error(self):
-        with pytest.raises(ValueError, match="non-empty strings"):
-            make_op(mutant_registers=["Add", 42])  # type: ignore[list-item]
+    def test_should_raise_type_error_when_mutant_list_is_not_a_list(self):
+        with pytest.raises(TypeError, match="must be a list"):
+            ConcreteOperator(id=1, name="AOR", mutant_registers="Add",
+                             mutant_list="wrong")  # type: ignore
 
-    def test_list_with_none_item_raises_value_error(self):
-        with pytest.raises(ValueError, match="non-empty strings"):
-            make_op(mutant_registers=["Add", None])  # type: ignore[list-item]
+    def test_should_raise_type_error_when_mutant_list_contains_non_mutant(self):
+        with pytest.raises(TypeError, match="Mutant instances"):
+            ConcreteOperator(id=1, name="AOR", mutant_registers="Add",
+                             mutant_list=["not_a_mutant"])  # type: ignore
 
-    def test_all_invalid_items_raises_value_error(self):
-        with pytest.raises(ValueError, match="non-empty strings"):
-            make_op(mutant_registers=["", "   "])
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# 6. _validate_mutant_registers — wrong type branch                            #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-class TestValidateMutantRegistersWrongType:
-
-    def test_integer_raises_type_error(self):
-        with pytest.raises(TypeError, match="must be a str or list"):
-            make_op(mutant_registers=42)  # type: ignore[arg-type]
-
-    def test_none_raises_type_error(self):
-        with pytest.raises(TypeError, match="must be a str or list"):
-            make_op(mutant_registers=None)  # type: ignore[arg-type]
-
-    def test_tuple_raises_type_error(self):
-        with pytest.raises(TypeError, match="must be a str or list"):
-            make_op(mutant_registers=("Add", "Sub"))  # type: ignore[arg-type]
-
-    def test_dict_raises_type_error(self):
-        with pytest.raises(TypeError, match="must be a str or list"):
-            make_op(mutant_registers={"key": "Add"})  # type: ignore[arg-type]
+    def test_should_not_allow_direct_instantiation_of_abstract_class(self):
+        with pytest.raises(TypeError):
+            Operator(id=1, name="AOR", mutant_registers="Add")  # type: ignore
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# 7. _validate_mutant_list                                                     #
-# ─────────────────────────────────────────────────────────────────────────── #
+# ===========================================================================
+# Factory method create()
+# ===========================================================================
 
-class TestValidateMutantList:
+class TestOperatorCreate:
 
-    def test_non_list_raises_type_error(self):
-        with pytest.raises(TypeError, match="mutant_list must be a list"):
-            make_op(mutant_list="not a list")  # type: ignore[arg-type]
+    def test_should_create_instance_via_factory_with_default_values(self):
+        o = ConcreteOperator.create()
+        assert o.id   == ConcreteOperator._DEFAULT_ID
+        assert o.name == ConcreteOperator._DEFAULT_NAME.upper()
+        assert o.mutant_registers == ConcreteOperator._DEFAULT_REGISTERS
 
-    def test_list_with_non_mutant_item_raises_type_error(self):
-        with pytest.raises(TypeError, match="All items in mutant_list must be Mutant"):
-            make_op(mutant_list=["not_a_mutant"])  # type: ignore[list-item]
+    def test_should_create_instance_with_list_registers_via_factory(self):
+        o = SpyOperator.create()
+        assert o.mutant_registers == ["NodeA", "NodeB"]
 
-    def test_list_with_integer_raises_type_error(self):
-        with pytest.raises(TypeError, match="All items in mutant_list must be Mutant"):
-            make_op(mutant_list=[1, 2, 3])  # type: ignore[list-item]
-
-    def test_mixed_valid_and_invalid_raises_type_error(self):
-        m = _make_mutant()
-        with pytest.raises(TypeError, match="All items in mutant_list must be Mutant"):
-            make_op(mutant_list=[m, "invalid"])  # type: ignore[list-item]
-
-    def test_valid_mutant_list_is_accepted(self):
-        m1, m2 = _make_mutant(1), _make_mutant(2)
-        op = make_op(mutant_list=[m1, m2])
-        assert len(op.mutant_list) == 2
+    def test_should_return_correct_subclass_type_from_factory(self):
+        assert isinstance(ConcreteOperator.create(), ConcreteOperator)
+        assert isinstance(SpyOperator.create(), SpyOperator)
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# 8. _assert_valid_tree                                                        #
-# ─────────────────────────────────────────────────────────────────────────── #
+# ===========================================================================
+# analyse_ast (interface + guards)
+# ===========================================================================
 
-class TestAssertValidTree:
+class TestAnalyseAst:
 
-    def test_valid_ast_module_passes(self):
-        op   = make_op()
-        tree = ast.parse("x = 1")
-        op._assert_valid_tree(tree)   # should not raise
+    def test_should_return_empty_list_for_concrete_operator(self, op, simple_ast):
+        result = op.analyse_ast(simple_ast)
+        assert result == []
 
-    def test_valid_ast_expression_passes(self):
-        op   = make_op()
-        tree = ast.parse("1 + 1", mode="eval")
-        op._assert_valid_tree(tree)
+    def test_should_return_list_of_ast_nodes(self, simple_ast):
+        o = SpyOperator.create()
+        result = o.analyse_ast(simple_ast)
+        assert isinstance(result, list)
+        assert all(isinstance(n, ast.AST) for n in result)
 
-    def test_string_raises_type_error(self):
-        op = make_op()
+    def test_should_raise_type_error_when_tree_is_not_ast(self, op):
         with pytest.raises(TypeError, match="ast.AST instance"):
-            op._assert_valid_tree("x = 1")  # type: ignore[arg-type]
+            op.analyse_ast("not an ast")  # type: ignore
 
-    def test_none_raises_type_error(self):
-        op = make_op()
+    def test_should_raise_type_error_when_tree_is_none(self, op):
         with pytest.raises(TypeError, match="ast.AST instance"):
-            op._assert_valid_tree(None)  # type: ignore[arg-type]
+            op.analyse_ast(None)  # type: ignore
 
-    def test_integer_raises_type_error(self):
-        op = make_op()
+    def test_should_raise_type_error_when_tree_is_integer(self, op):
         with pytest.raises(TypeError, match="ast.AST instance"):
-            op._assert_valid_tree(42)  # type: ignore[arg-type]
+            op.analyse_ast(42)  # type: ignore
 
-    def test_list_raises_type_error(self):
-        op = make_op()
-        with pytest.raises(TypeError, match="ast.AST instance"):
-            op._assert_valid_tree([ast.parse("x=1")])  # type: ignore[arg-type]
+    def test_should_accept_any_valid_ast_module(self, op):
+        tree = ast.parse("def f(): pass\nf()")
+        assert op.analyse_ast(tree) == []
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# 9. _assert_valid_nodes                                                       #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-class TestAssertValidNodes:
-
-    def test_empty_list_passes(self):
-        op = make_op()
-        op._assert_valid_nodes([])   # should not raise
-
-    def test_list_of_ast_nodes_passes(self):
-        op    = make_op()
-        nodes = list(ast.walk(ast.parse("x = 1")))
-        op._assert_valid_nodes(nodes)
-
-    def test_non_list_raises_type_error(self):
-        op = make_op()
-        with pytest.raises(TypeError, match="nodes must be a list"):
-            op._assert_valid_nodes("not a list")  # type: ignore[arg-type]
-
-    def test_tuple_raises_type_error(self):
-        op = make_op()
-        with pytest.raises(TypeError, match="nodes must be a list"):
-            op._assert_valid_nodes((ast.parse("x=1"),))  # type: ignore[arg-type]
-
-    def test_list_with_non_ast_item_raises_type_error(self):
-        op    = make_op()
-        valid = ast.parse("x = 1")
-        with pytest.raises(TypeError, match="All items in nodes must be"):
-            op._assert_valid_nodes([valid, "not_an_ast"])  # type: ignore[list-item]
-
-    def test_list_with_none_raises_type_error(self):
-        op = make_op()
-        with pytest.raises(TypeError, match="All items in nodes must be"):
-            op._assert_valid_nodes([None])  # type: ignore[list-item]
-
-    def test_list_with_integer_raises_type_error(self):
-        op = make_op()
-        with pytest.raises(TypeError, match="All items in nodes must be"):
-            op._assert_valid_nodes([1, 2])  # type: ignore[list-item]
+    def test_should_accept_empty_module_ast(self, op):
+        tree = ast.parse("")
+        assert op.analyse_ast(tree) == []
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# 10. _assert_valid_path                                                       #
-# ─────────────────────────────────────────────────────────────────────────── #
+# ===========================================================================
+# build_mutant (interface + guards)
+# ===========================================================================
 
-class TestAssertValidPath:
+class TestBuildMutant:
 
-    def test_valid_path_string_passes(self):
-        op = make_op()
-        op._assert_valid_path("/some/path/file.py", "original_path")
+    def test_should_return_empty_list_when_no_nodes_given(self, op, simple_ast, tmp_path):
+        result = op.build_mutant([], simple_ast, "/src/f.py", str(tmp_path))
+        assert result == []
 
-    def test_relative_path_string_passes(self):
-        op = make_op()
-        op._assert_valid_path("relative/path.py", "original_path")
+    def test_should_raise_type_error_when_nodes_is_not_list(self, op, simple_ast, tmp_path):
+        with pytest.raises(TypeError, match="must be a list"):
+            op.build_mutant(None, simple_ast, "/src/f.py", str(tmp_path))  # type: ignore
 
-    def test_empty_string_raises_value_error(self):
-        op = make_op()
-        with pytest.raises(ValueError, match="must be a non-empty string"):
-            op._assert_valid_path("", "original_path")
+    def test_should_raise_type_error_when_nodes_contains_non_ast(self, op, simple_ast, tmp_path):
+        with pytest.raises(TypeError, match="ast.AST instances"):
+            op.build_mutant(["not_ast"], simple_ast, "/src/f.py", str(tmp_path))  # type: ignore
 
-    def test_whitespace_only_raises_value_error(self):
-        op = make_op()
-        with pytest.raises(ValueError, match="must be a non-empty string"):
-            op._assert_valid_path("   ", "original_path")
+    def test_should_raise_value_error_when_original_path_is_empty(self, op, simple_ast, tmp_path):
+        with pytest.raises(ValueError, match="original_path"):
+            op.build_mutant([], simple_ast, "", str(tmp_path))
 
-    def test_none_raises_value_error(self):
-        op = make_op()
-        with pytest.raises(ValueError, match="must be a non-empty string"):
-            op._assert_valid_path(None, "original_path")  # type: ignore[arg-type]
+    def test_should_raise_value_error_when_original_path_is_whitespace(self, op, simple_ast, tmp_path):
+        with pytest.raises(ValueError, match="original_path"):
+            op.build_mutant([], simple_ast, "   ", str(tmp_path))
 
-    def test_integer_raises_value_error(self):
-        op = make_op()
-        with pytest.raises(ValueError, match="must be a non-empty string"):
-            op._assert_valid_path(123, "mutant_dir")  # type: ignore[arg-type]
-
-    def test_param_name_appears_in_error_message(self):
-        op = make_op()
+    def test_should_raise_value_error_when_mutant_dir_is_empty(self, op, simple_ast):
         with pytest.raises(ValueError, match="mutant_dir"):
-            op._assert_valid_path("", "mutant_dir")
+            op.build_mutant([], simple_ast, "/src/f.py", "")
+
+    def test_should_raise_value_error_when_mutant_dir_is_whitespace(self, op, simple_ast):
+        with pytest.raises(ValueError, match="mutant_dir"):
+            op.build_mutant([], simple_ast, "/src/f.py", "   ")
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# 11. _next_mutant_id                                                          #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-class TestNextMutantId:
-
-    def test_returns_one_when_list_is_empty(self):
-        op = make_op()
-        assert op._next_mutant_id() == 1
-
-    def test_returns_two_after_one_mutant(self):
-        op = make_op(mutant_list=[_make_mutant(1)])
-        assert op._next_mutant_id() == 2
-
-    def test_returns_n_plus_one_after_n_mutants(self):
-        mutants = [_make_mutant(i) for i in range(1, 6)]
-        op      = make_op(mutant_list=mutants)
-        assert op._next_mutant_id() == 6
-
-    def test_is_consistent_across_multiple_calls_without_appending(self):
-        op = make_op()
-        assert op._next_mutant_id() == op._next_mutant_id()
-
-    def test_increments_after_appending_to_list(self):
-        op = make_op()
-        first = op._next_mutant_id()
-        op.mutant_list.append(_make_mutant(first))
-        second = op._next_mutant_id()
-        assert second == first + 1
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# 12. clear_mutant_list                                                        #
-# ─────────────────────────────────────────────────────────────────────────── #
+# ===========================================================================
+# clear_mutant_list
+# ===========================================================================
 
 class TestClearMutantList:
 
-    def test_clears_populated_list(self):
-        op = make_op(mutant_list=[_make_mutant(1), _make_mutant(2)])
+    def test_should_empty_mutant_list_when_populated(self, op, sample_mutant):
+        op.mutant_list.append(sample_mutant)
         op.clear_mutant_list()
         assert op.mutant_list == []
 
-    def test_clear_on_empty_list_is_safe(self):
-        op = make_op()
-        op.clear_mutant_list()   # should not raise
+    def test_should_not_raise_when_list_is_already_empty(self, op):
+        op.clear_mutant_list()  # não deve lançar exceção
         assert op.mutant_list == []
 
-    def test_other_attributes_unchanged_after_clear(self):
-        op = make_op(
-            id=7,
-            name="ror",
-            mutant_registers=["Lt", "Gt"],
-            mutant_list=[_make_mutant()],
-        )
+    def test_should_allow_new_mutants_after_clearing(self, op, sample_mutant):
+        op.mutant_list.append(sample_mutant)
         op.clear_mutant_list()
-        assert op.id   == 7
-        assert op.name == "ROR"
-        assert op.mutant_registers == ["Lt", "Gt"]
-
-    def test_list_grows_again_after_clear(self):
-        op = make_op(mutant_list=[_make_mutant(1)])
-        op.clear_mutant_list()
-        op.mutant_list.append(_make_mutant(2))
+        op.mutant_list.append(sample_mutant)
         assert len(op.mutant_list) == 1
-        assert op.mutant_list[0].id == 2
+
+    def test_should_return_none(self, op):
+        assert op.clear_mutant_list() is None
+
+    def test_should_log_info_on_clear(self, op, caplog):
+        with caplog.at_level(logging.INFO, logger="operator_module"):
+            op.clear_mutant_list()
+        assert "cleared" in caplog.text
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# 13. __repr__                                                                 #
-# ─────────────────────────────────────────────────────────────────────────── #
+# ===========================================================================
+# _replace_node
+# ===========================================================================
 
-class TestRepr:
+class TestReplaceNode:
 
-    def test_repr_contains_class_name(self):
-        op = make_op()
-        assert "ConcreteOperator" in repr(op)
+    def test_should_replace_target_node_in_cloned_tree(self, op):
+        tree = ast.parse("x = 1 + 2")
+        # Encontra o nó Add
+        add_node = next(
+            n for n in ast.walk(tree) if isinstance(n, ast.Add)
+        )
+        result = op._replace_node(tree, add_node, ast.Sub())
+        # O unparse deve conter subtração
+        assert "1 - 2" in ast.unparse(result)
 
-    def test_repr_contains_id(self):
-        op = make_op(id=5)
-        assert "id=5" in repr(op)
+    def test_should_not_modify_original_tree(self, op):
+        tree = ast.parse("x = 1 + 2")
+        original_src = ast.unparse(tree)
+        add_node = next(n for n in ast.walk(tree) if isinstance(n, ast.Add))
+        op._replace_node(tree, add_node, ast.Sub())
+        assert ast.unparse(tree) == original_src
 
-    def test_repr_contains_normalised_name(self):
-        op = make_op(name="aor")
+    def test_should_return_ast_instance(self, op):
+        tree = ast.parse("x = 1 + 2")
+        add_node = next(n for n in ast.walk(tree) if isinstance(n, ast.Add))
+        result = op._replace_node(tree, add_node, ast.Sub())
+        assert isinstance(result, ast.AST)
+
+    def test_should_return_unchanged_tree_when_target_not_found(self, op):
+        tree   = ast.parse("x = 1 + 2")
+        other  = ast.parse("y = 3 * 4")
+        mult   = next(n for n in ast.walk(other) if isinstance(n, ast.Mult))
+        result = op._replace_node(tree, mult, ast.Add())
+        # nenhuma substituição deve ocorrer
+        assert "1 + 2" in ast.unparse(result)
+
+    def test_should_fix_missing_locations_in_result(self, op):
+        tree = ast.parse("a = True")
+        name = next(n for n in ast.walk(tree) if isinstance(n, ast.Constant))
+        result = op._replace_node(tree, name, ast.Constant(value=False))
+        # fix_missing_locations garante que lineno existe nos nós
+        for node in ast.walk(result):
+            if hasattr(node, "lineno"):
+                assert node.lineno is not None
+
+
+# ===========================================================================
+# _write_mutant_file
+# ===========================================================================
+
+class TestWriteMutantFile:
+
+    def test_should_write_py_file_to_disk(self, op, tmp_path):
+        tree = ast.parse("x = 99")
+        path = op._write_mutant_file(tree, str(tmp_path), "mutant_1.py")
+        assert Path(path).exists()
+
+    def test_should_return_absolute_path_string(self, op, tmp_path):
+        tree = ast.parse("x = 1")
+        path = op._write_mutant_file(tree, str(tmp_path), "m.py")
+        assert Path(path).is_absolute()
+
+    def test_should_write_valid_python_source(self, op, tmp_path):
+        tree = ast.parse("result = 2 + 3")
+        path = op._write_mutant_file(tree, str(tmp_path), "m.py")
+        content = Path(path).read_text(encoding="utf-8")
+        # deve ser parseable novamente
+        parsed = ast.parse(content)
+        assert isinstance(parsed, ast.Module)
+
+    def test_should_create_parent_directories_if_missing(self, op, tmp_path):
+        nested = str(tmp_path / "a" / "b" / "c")
+        tree = ast.parse("pass")
+        path = op._write_mutant_file(tree, nested, "m.py")
+        assert Path(path).exists()
+
+    def test_should_overwrite_existing_file(self, op, tmp_path):
+        tree1 = ast.parse("x = 1")
+        tree2 = ast.parse("x = 999")
+        op._write_mutant_file(tree1, str(tmp_path), "m.py")
+        path = op._write_mutant_file(tree2, str(tmp_path), "m.py")
+        assert "999" in Path(path).read_text()
+
+
+# ===========================================================================
+# _next_mutant_id
+# ===========================================================================
+
+class TestNextMutantId:
+
+    def test_should_return_sequential_integers(self, op):
+        ids = [op._next_mutant_id() for _ in range(5)]
+        assert ids == list(range(1, 6))
+
+    def test_should_return_integer_type(self, op):
+        assert isinstance(op._next_mutant_id(), int)
+
+    def test_should_share_counter_across_operator_instances(self):
+        o1 = ConcreteOperator(id=1, name="AOR", mutant_registers="Add")
+        o2 = ConcreteOperator(id=2, name="ROR", mutant_registers="Lt")
+        o1._next_mutant_id()   # 1
+        o1._next_mutant_id()   # 2
+        assert o2._next_mutant_id() == 3  # Singleton compartilhado
+
+
+# ===========================================================================
+# Guards protegidos (_assert_*)
+# ===========================================================================
+
+class TestAssertGuards:
+
+    # _assert_valid_tree
+    def test_should_pass_when_tree_is_ast_instance(self, op, simple_ast):
+        op._assert_valid_tree(simple_ast)  # sem exceção
+
+    def test_should_raise_type_error_for_non_ast_tree(self, op):
+        with pytest.raises(TypeError, match="ast.AST instance"):
+            op._assert_valid_tree({"key": "value"})  # type: ignore
+
+    # _assert_valid_nodes
+    def test_should_pass_when_nodes_is_empty_list(self, op):
+        op._assert_valid_nodes([])
+
+    def test_should_pass_when_nodes_contains_ast_items(self, op, simple_ast):
+        nodes = list(ast.walk(simple_ast))[:2]
+        op._assert_valid_nodes(nodes)
+
+    def test_should_raise_type_error_when_nodes_is_not_list(self, op):
+        with pytest.raises(TypeError, match="must be a list"):
+            op._assert_valid_nodes(("a",))  # type: ignore
+
+    def test_should_raise_type_error_when_nodes_has_non_ast_item(self, op):
+        with pytest.raises(TypeError, match="ast.AST instances"):
+            op._assert_valid_nodes([ast.parse("x=1"), "bad"])  # type: ignore
+
+    # _assert_valid_path
+    def test_should_pass_when_path_is_non_empty_string(self, op):
+        op._assert_valid_path("/some/path.py", "original_path")
+
+    def test_should_raise_value_error_when_path_is_empty_string(self, op):
+        with pytest.raises(ValueError, match="original_path"):
+            op._assert_valid_path("", "original_path")
+
+    def test_should_raise_value_error_when_path_is_whitespace(self, op):
+        with pytest.raises(ValueError, match="mutant_dir"):
+            op._assert_valid_path("   ", "mutant_dir")
+
+    def test_should_raise_value_error_when_path_is_not_string(self, op):
+        with pytest.raises(ValueError, match="original_path"):
+            op._assert_valid_path(None, "original_path")  # type: ignore
+
+
+# ===========================================================================
+# Logging helpers
+# ===========================================================================
+
+class TestLoggingHelpers:
+
+    def test_should_log_info_with_count_and_description_in_analyse_ast_found(
+        self, op, caplog
+    ):
+        with caplog.at_level(logging.INFO, logger="operator_module"):
+            op._log_analyse_ast_found(3, "binary operations")
+        assert "3" in caplog.text
+        assert "binary operations" in caplog.text
+
+    def test_should_log_warning_with_reason_in_skipping_node(self, op, caplog):
+        with caplog.at_level(logging.WARNING, logger="operator_module"):
+            op._log_skipping_node("no eligible sub-conditions found")
+        assert "no eligible sub-conditions found" in caplog.text
+
+    def test_should_log_info_with_mutant_id_and_details_in_mutant_created(
+        self, op, caplog
+    ):
+        with caplog.at_level(logging.INFO, logger="operator_module"):
+            op._log_mutant_created(42, "line 7 Add→Sub")
+        assert "42" in caplog.text
+        assert "line 7 Add→Sub" in caplog.text
+
+    def test_should_log_total_mutant_count_in_build_mutant_done(
+        self, op, sample_mutant, caplog
+    ):
+        op.mutant_list.append(sample_mutant)
+        with caplog.at_level(logging.INFO, logger="operator_module"):
+            op._log_build_mutant_done()
+        assert "1" in caplog.text
+
+    def test_should_log_zero_when_mutant_list_is_empty_in_build_mutant_done(
+        self, op, caplog
+    ):
+        with caplog.at_level(logging.INFO, logger="operator_module"):
+            op._log_build_mutant_done()
+        assert "0" in caplog.text
+
+
+# ===========================================================================
+# __repr__
+# ===========================================================================
+
+class TestOperatorRepr:
+
+    def test_should_start_with_class_name(self, op):
+        assert repr(op).startswith("ConcreteOperator(")
+
+    def test_should_include_id_in_repr(self, op):
+        assert "id=1" in repr(op)
+
+    def test_should_include_name_in_repr(self, op):
         assert "name='AOR'" in repr(op)
 
-    def test_repr_contains_mutant_registers_str(self):
-        op = make_op(mutant_registers="Add")
-        assert "'Add'" in repr(op)
+    def test_should_include_mutant_registers_in_repr(self, op):
+        assert "mutant_registers='Add'" in repr(op)
 
-    def test_repr_contains_mutant_registers_list(self):
-        op = make_op(mutant_registers=["Lt", "Gt"])
-        assert "['Lt', 'Gt']" in repr(op)
-
-    def test_repr_shows_zero_mutants_when_empty(self):
-        op = make_op()
+    def test_should_show_zero_mutants_when_list_is_empty(self, op):
         assert "mutants=0" in repr(op)
 
-    def test_repr_shows_correct_mutant_count(self):
-        op = make_op(mutant_list=[_make_mutant(1), _make_mutant(2)])
-        assert "mutants=2" in repr(op)
+    def test_should_show_correct_mutant_count_when_list_is_populated(
+        self, op, sample_mutant
+    ):
+        op.mutant_list.append(sample_mutant)
+        assert "mutants=1" in repr(op)
 
-    def test_repr_updates_after_clear(self):
-        op = make_op(mutant_list=[_make_mutant()])
-        op.clear_mutant_list()
-        assert "mutants=0" in repr(op)
+    def test_should_return_string_type(self, op):
+        assert isinstance(repr(op), str)
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# 14. Abstract enforcement                                                     #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-class TestAbstractEnforcement:
-
-    def test_missing_analyse_ast_raises_type_error(self):
-        class MissingAnalyse(Operator):
-            def build_mutant(self, nodes, original_ast, original_path, mutant_dir):
-                return self.mutant_list
-
-        with pytest.raises(TypeError):
-            MissingAnalyse(id=1, name="X", mutant_registers="Add")
-
-    def test_missing_build_mutant_raises_type_error(self):
-        class MissingBuild(Operator):
-            def analyse_ast(self, tree):
-                return []
-
-        with pytest.raises(TypeError):
-            MissingBuild(id=1, name="X", mutant_registers="Add")
-
-    def test_missing_both_abstract_methods_raises_type_error(self):
-        class MissingBoth(Operator):
-            pass
-
-        with pytest.raises(TypeError):
-            MissingBoth(id=1, name="X", mutant_registers="Add")
-
-    def test_concrete_subclass_with_both_methods_instantiates(self):
-        op = ConcreteOperator(id=1, name="TEST", mutant_registers="Add")
-        assert op is not None
-
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# 15. ABC cannot be instantiated directly                                      #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-class TestAbstractBaseCannotBeInstantiated:
-
-    def test_operator_itself_cannot_be_instantiated(self):
-        with pytest.raises(TypeError):
-            Operator(id=1, name="X", mutant_registers="Add")  # type: ignore[abstract]
+    def test_should_use_subclass_name_not_operator(self):
+        o = SpyOperator.create()
+        assert repr(o).startswith("SpyOperator(")
