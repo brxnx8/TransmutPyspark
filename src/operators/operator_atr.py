@@ -1,14 +1,3 @@
-# src/operators/operator_atr.py
-"""
-ATR – Aggregation Transformation Replacement
-=============================================
-Alvo (DataFrame API):
-  - df.groupBy(...).agg(F.sum("x"))   → troca função de agregação
-  - df.groupBy(...).sum("x")          → shorthand
-  - F.rank().over(window)             → troca função de janela
-  - groupBy key                       → remove uma das chaves
-"""
-
 import ast
 import copy
 from dataclasses import dataclass, field
@@ -56,7 +45,6 @@ def _swap_func(call: ast.Call, new_name: str) -> ast.Call:
 
 
 def _find_agg_calls(tree: ast.AST) -> list[ast.Call]:
-    """Retorna chamadas .agg() ou shorthand precedidas de .groupBy()."""
     result = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -129,14 +117,12 @@ class OperatorATR(Operator):
             call_node = cast(ast.Call, node)
             mname = _method_name(call_node)
 
-            # ── Caso A: .agg(F.sum("col"), ...) ──────────────────────────
             if mname == "agg":
                 for arg_idx, arg in enumerate(call_node.args):
                     if not isinstance(arg, ast.Call) or not _is_agg_call(arg):
                         continue
                     current_fn = _func_name(arg)
 
-                    # A1: troca a função de agregação
                     for new_fn in _AGG_FUNCTIONS:
                         if new_fn == current_fn:
                             continue
@@ -147,7 +133,6 @@ class OperatorATR(Operator):
                         self._emit(original_ast, call_node, new_agg,
                                    original_path, mutant_dir, call_node, label)
 
-                    # A2: troca a coluna de entrada
                     if arg.args and isinstance(arg.args[0], ast.Constant):
                         col_name = arg.args[0].value
                         for candidate in all_strings:
@@ -161,7 +146,6 @@ class OperatorATR(Operator):
                             self._emit(original_ast, call_node, new_agg,
                                        original_path, mutant_dir, call_node, label)
 
-            # ── Caso B: .groupBy().sum() shorthand ────────────────────────
             elif mname in _GROUPBY_SHORTHANDS:
                 for new_fn in _AGG_FUNCTIONS:
                     if new_fn == mname:
@@ -171,7 +155,6 @@ class OperatorATR(Operator):
                     self._emit(original_ast, call_node, replacement,
                                original_path, mutant_dir, call_node, label)
 
-            # ── Caso C: funções de janela ─────────────────────────────────
             elif _is_window_call(call_node):
                 current = _func_name(call_node)
                 for new_fn in _WINDOW_FUNCTIONS:
@@ -182,7 +165,6 @@ class OperatorATR(Operator):
                     self._emit(original_ast, call_node, replacement,
                                original_path, mutant_dir, call_node, label)
 
-        # ── Caso D: remoção de chave do groupBy ───────────────────────────
         self._mutate_groupby_keys(original_ast, original_path, mutant_dir)
 
         self._log_build_mutant_done()

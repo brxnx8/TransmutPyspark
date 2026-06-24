@@ -1,29 +1,17 @@
-"""
-resolver.py
-===========
-Normaliza qualquer forma de entrada (arquivo único, diretório, toml)
-em um ResolvedConfig uniforme.  O MutationManager sempre recebe
-ResolvedConfig — nunca sabe qual modo foi usado.
-"""
 from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# tomllib é stdlib no Python 3.11+; usa tomli como fallback
 if sys.version_info >= (3, 11):
     import tomllib
 else:
     try:
-        import tomli as tomllib          # pip install tomli
+        import tomli as tomllib
     except ImportError:
-        tomllib = None                   # type: ignore[assignment]
+        tomllib = None
 
-
-# ─────────────────────────────────────────────────────────────────────── #
-# Constantes                                                               #
-# ─────────────────────────────────────────────────────────────────────── #
 
 _IGNORE_FILES: frozenset[str] = frozenset({
     "__init__.py", "conftest.py", "setup.py",
@@ -36,21 +24,12 @@ _IGNORE_DIRS: frozenset[str] = frozenset({
 })
 
 
-# ─────────────────────────────────────────────────────────────────────── #
-# Modelo de saída                                                          #
-# ─────────────────────────────────────────────────────────────────────── #
-
 @dataclass
 class ResolvedConfig:
-    """
-    Contrato único consumido pelo MutationManager.
-    Independente de como o usuário configurou a ferramenta.
-    """
     source_files:  list[Path]
     test_files:    list[Path]
     operators:     list[str]
     workspace_dir: Path
-    # targets é preenchido pelo ast_analyzer após a resolução
     targets:       list = field(default_factory=list)
 
     def validate(self) -> None:
@@ -74,16 +53,8 @@ class ResolvedConfig:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────── #
-# Entry points públicos                                                    #
-# ─────────────────────────────────────────────────────────────────────── #
 
 def resolve_from_dict(raw: dict) -> ResolvedConfig:
-    """
-    Constrói ResolvedConfig a partir de um dicionário cru (config.txt legado
-    ou flags CLI).  Suporta tanto as chaves antigas (program_path / tests_path)
-    quanto as novas (source_dirs / tests_dirs).
-    """
     operators = [
         op.strip().upper()
         for op in raw.get("operators_list", "").split(",")
@@ -94,7 +65,6 @@ def resolve_from_dict(raw: dict) -> ResolvedConfig:
 
     workspace = Path(raw.get("workspace_dir", ".").strip())
 
-    # Suporte a chave antiga (arquivo único) e nova (diretório/lista)
     src_entry  = raw.get("program_path") or raw.get("source_dirs")
     test_entry = raw.get("tests_path")   or raw.get("tests_dirs")
 
@@ -112,7 +82,6 @@ def resolve_from_dict(raw: dict) -> ResolvedConfig:
 
 
 def resolve_from_toml(toml_path: Path) -> ResolvedConfig:
-    """Lê transmut.toml e devolve ResolvedConfig."""
     if tomllib is None:
         raise ImportError(
             "Python < 3.11 requer 'tomli': pip install tomli"
@@ -133,18 +102,7 @@ def resolve_from_toml(toml_path: Path) -> ResolvedConfig:
     return cfg
 
 
-# ─────────────────────────────────────────────────────────────────────── #
-# Helpers privados                                                         #
-# ─────────────────────────────────────────────────────────────────────── #
-
 def _resolve_entry(entry: str | list | None) -> list[Path]:
-    """
-    Aceita:
-      - None                  → lista vazia
-      - string de arquivo.py  → Modo 1 (arquivo único)
-      - string de diretório   → Modo 2 (glob recursivo)
-      - lista de strings      → Modo 2 para cada item
-    """
     if not entry:
         return []
 
@@ -167,19 +125,12 @@ def _resolve_entry(entry: str | list | None) -> list[Path]:
 
 
 def _discover_py(directory: Path) -> list[Path]:
-    """
-    Descobre arquivos .py elegíveis recursivamente,
-    ignorando __init__.py, conftest.py, pastas de ambiente virtual, etc.
-    """
     found: list[Path] = []
     for f in sorted(directory.rglob("*.py")):
-        # Ignora arquivos de convenção
         if f.name in _IGNORE_FILES:
             continue
-        # Ignora pastas problemáticas em qualquer nível do path
         if any(part in _IGNORE_DIRS for part in f.parts):
             continue
-        # Ignora pastas/arquivos ocultos
         if any(part.startswith(".") for part in f.parts):
             continue
         found.append(f)

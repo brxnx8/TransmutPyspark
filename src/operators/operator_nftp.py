@@ -1,17 +1,3 @@
-# src/operators/operator_nftp.py
-"""
-NFTP – Negation of Filter Transformation Predicate
-====================================================
-Alvo (DataFrame API):
-  - df.filter(<pred>) / df.where(<pred>)
-
-Mutações:
-  1. Negação total:         ~pred
-  2. Inversão de operador:  > → <=,  == → !=,  & → |
-  3. isNull ↔ isNotNull
-  4. isin  → ~isin
-"""
-
 import ast
 import copy
 from dataclasses import dataclass, field
@@ -140,14 +126,12 @@ class OperatorNFTP(Operator):
             method = _method_name(call_node) or "unknown"
             line = getattr(pred, "lineno", "?")
 
-            # Mutante 1 — negação total
             self._emit(
                 original_ast, pred, _build_negation(pred),
                 original_path, mutant_dir,
                 call_node, pred, "full_negation",
             )
 
-            # Mutantes 2+ — inversão pontual de operadores
             op_pairs = _collect_operator_mutations(pred)
             if not op_pairs:
                 self._log_skipping_node(

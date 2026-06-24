@@ -1,15 +1,3 @@
-"""
-Reporter
-========
-Consolidates mutation-testing results and produces report.html inside the
-TransmutPysparkOutput workdir provided by MutationManager.
-
-Estrutura do relatório:
-  arquivo fonte (ex: atr.py)
-    └── operador (ex: ATR)
-          └── mutante 001 — diff + source
-"""
-
 import ast
 import difflib
 import logging
@@ -26,10 +14,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-# ------------------------------------------------------------------ #
-# Helpers de diff                                                      #
-# ------------------------------------------------------------------ #
 
 def _normalise_source(source: str) -> str:
     try:
@@ -52,11 +36,6 @@ def _compute_diff(original_source: str, mutant_source: str, mutant_id: int) -> s
     ))
     return "".join(diff_lines)
 
-
-# ------------------------------------------------------------------ #
-# Reporter                                                             #
-# ------------------------------------------------------------------ #
-
 @dataclass
 class Reporter:
     result_list:      list[TestResult]
@@ -71,9 +50,6 @@ class Reporter:
         self._validate_mutant_list()
         self._validate_output_dir()
 
-    # ------------------------------------------------------------------ #
-    # Public API                                                           #
-    # ------------------------------------------------------------------ #
 
     def calculate(self) -> "Reporter":
         total    = len(self.result_list)
@@ -127,7 +103,6 @@ class Reporter:
                 )
                 continue
 
-            # Lê o arquivo original correto de cada mutante para o diff
             try:
                 original_source = Path(mutant.original_path).read_text(encoding="utf-8")
             except (FileNotFoundError, OSError):
@@ -158,10 +133,6 @@ class Reporter:
         logger.info(f"[Reporter.show_results] Report saved to: {output_path}")
         return self
 
-    # ------------------------------------------------------------------ #
-    # HTML builder — estrutura: arquivo fonte → operador → mutantes       #
-    # ------------------------------------------------------------------ #
-
     def _build_html(self) -> str:
         rc    = self.result_calculate
         score = rc.get("mutation_score", 0.0)
@@ -183,7 +154,6 @@ class Reporter:
         timeout_pct  = rc.get("timeout",  0) / total * 100 if total else 0
         error_pct    = rc.get("error",    0) / total * 100 if total else 0
 
-        # Agrupa: source_file → operator → [mutants]
         by_file: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
         for mutant in self.mutant_list:
             by_file[Path(mutant.original_path).name][mutant.operator].append(mutant)
@@ -541,9 +511,6 @@ class Reporter:
 </body>
 </html>"""
 
-    # ------------------------------------------------------------------ #
-    # HTML helpers                                                         #
-    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _escape(text: str) -> str:
@@ -569,9 +536,6 @@ class Reporter:
                 result.append(line)
         return "\n".join(result)
 
-    # ------------------------------------------------------------------ #
-    # Guards & validators                                                  #
-    # ------------------------------------------------------------------ #
 
     def _assert_calculated(self) -> None:
         if "mutation_score" not in self.result_calculate:

@@ -1,15 +1,3 @@
-"""
-TestRunner
-==========
-Executa o pytest contra cada mutante em paralelo.
-
-Mudanças em relação à versão anterior:
-  - Aceita ResolvedConfig em vez de ConfigLoader legado
-  - Usa mutant.test_files e mutant.test_functions para rodar só os
-    testes mapeados (escopo cirúrgico de execução)
-  - Fallback para tests_path completo quando não há mapeamento
-"""
-
 import os
 import shutil
 import subprocess
@@ -39,9 +27,6 @@ class TestRunner:
         if self.max_workers < 1:
             raise ValueError(f"max_workers deve ser >= 1, recebeu: {self.max_workers}")
 
-    # ------------------------------------------------------------------ #
-    # API pública                                                          #
-    # ------------------------------------------------------------------ #
 
     def run_test(self) -> list[TestResult]:
         if not self.mutant_list:
@@ -87,20 +72,14 @@ class TestRunner:
         )
         return self.results
 
-    # ------------------------------------------------------------------ #
-    # Execução de mutante individual                                       #
-    # ------------------------------------------------------------------ #
 
     def _run_single_mutant(self, mutant, sandbox_root: Path) -> TestResult:
         mutant_path   = Path(mutant.mutant_path)
         original_name = Path(mutant.original_path).name   # ex: uts.py
 
-        # Sandbox isolado por mutante
         sandbox_dir = sandbox_root / f"sandbox_{mutant.id}"
         sandbox_dir.mkdir(exist_ok=True)
 
-        # Copia o arquivo mutante com o nome original para que os imports
-        # dos testes continuem funcionando
         target_file = sandbox_dir / original_name
         target_file.write_text(
             mutant_path.read_text(encoding="utf-8"), encoding="utf-8"
@@ -111,21 +90,15 @@ class TestRunner:
             original_source_dir=Path(mutant.original_path).parent,
         )
 
-        # ── Resolve quais arquivos de teste rodar ──────────────────────
-        # Usa os test_files mapeados pelo ast_analyzer; fallback para
-        # todos os test_files do config quando não há mapeamento
         if mutant.test_files:
             test_paths = [str(tf) for tf in mutant.test_files]
         else:
             test_paths = [str(tf) for tf in self.config.test_files]
 
         import sys
-        # Usa 'python -m pytest' em vez do binário pytest diretamente.
-        # Garante que o pytest correto (do mesmo ambiente Python) é usado,
-        # independente de estar num venv, conda ou instalação global.
+
         cmd = [sys.executable, "-m", "pytest", *test_paths, "-x", "-q", "--tb=short"]
 
-        # Filtro por nome de função de teste quando mapeado (mais rápido)
         if mutant.test_functions:
             k_expr = " or ".join(mutant.test_functions)
             cmd += ["-k", k_expr]
@@ -167,26 +140,16 @@ class TestRunner:
         finally:
             shutil.rmtree(sandbox_dir, ignore_errors=True)
 
-    # ------------------------------------------------------------------ #
-    # Helpers                                                              #
-    # ------------------------------------------------------------------ #
-
     @staticmethod
     def _build_env(sandbox_dir: Path, original_source_dir: Path | None = None) -> dict:
-        """Monta o PYTHONPATH injetando o sandbox e o diretório fonte no início."""
         import sys
         env = os.environ.copy()
 
-        # Garante que o bin do Python atual (venv) está no PATH do subprocess
         python_bin_dir = str(Path(sys.executable).parent)
         current_path = env.get("PATH", "")
         if python_bin_dir not in current_path:
             env["PATH"] = python_bin_dir + os.pathsep + current_path
 
-        # Monta PYTHONPATH:
-        # 1. sandbox_dir      — contém o arquivo mutante (substitui o original)
-        # 2. original_source_dir — contém os outros módulos fonte (imports dos testes)
-        # 3. paths existentes
         current_pythonpath = env.get("PYTHONPATH", "").strip()
 
         parts = [str(sandbox_dir)]

@@ -1,8 +1,4 @@
 class MutantIDManager:
-    """
-    Gerenciador centralizado de IDs de mutantes.
-    Singleton que garante IDs únicos e sequenciais em toda a execução.
-    """
     _instance = None
     _counter: int = 0
 

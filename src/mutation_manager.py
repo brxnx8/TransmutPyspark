@@ -1,16 +1,3 @@
-"""
-MutationManager
-===============
-Orquestrador do pipeline de mutação.
-
-Mudanças em relação à versão anterior:
-  - load() usa ConfigLoader novo (suporta 3 modos de entrada)
-  - parse_to_ast() constrói um dict source_file → AST (múltiplos arquivos)
-  - apply_mutation() itera sobre FunctionTargets em vez da AST inteira,
-    garantindo escopo cirúrgico por função
-  - run_tests() e agregate_results() inalterados na interface pública
-"""
-
 import importlib
 import logging
 import shutil
@@ -33,14 +20,8 @@ OPERATOR_REGISTRY = {
 
 
 class MutationManager:
-    """Orquestrador do pipeline de mutation testing."""
 
     def __init__(self, config_input: str | dict) -> None:
-        """
-        Aceita:
-          - str  → config.txt, transmut.toml, arquivo .py ou diretório
-          - dict → config em memória (gerado pela CLI com --src / --tests)
-        """
         self.config_input  = config_input
         self.config: ResolvedConfig | None = None
 
@@ -53,22 +34,15 @@ class MutationManager:
         self.result_list = []
         self.work_dir: Path | None = None
 
-    # ------------------------------------------------------------------ #
-    # Pipeline steps                                                       #
-    # ------------------------------------------------------------------ #
-
     def load(self) -> "MutationManager":
-        """Carrega configuração, descobre arquivos e extrai FunctionTargets."""
         self.config = ConfigLoader(self.config_input).load()
 
-        # Prepara workdir
         self.work_dir = self.config.workspace_dir / _OUTPUT_DIR_NAME
         if self.work_dir.exists():
             self._safe_rmtree(self.work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Workdir criado: {self.work_dir}")
 
-        # Lê código de todos os arquivos fonte
         for sf in self.config.source_files:
             self.source_codes[sf.resolve()] = sf.read_text(encoding="utf-8")
 
@@ -81,7 +55,6 @@ class MutationManager:
         return self
 
     def parse_to_ast(self) -> "MutationManager":
-        """Converte cada arquivo fonte em AST."""
         import ast as _ast
         if not self.source_codes:
             raise RuntimeError("Chame load() primeiro.")
@@ -90,7 +63,6 @@ class MutationManager:
             try:
                 tree = _ast.parse(code, filename=str(sf))
                 _ast.fix_missing_locations(tree)
-                # Usa sempre o path resolvido (absoluto) como chave
                 self.source_asts[sf.resolve()] = tree
             except SyntaxError as e:
                 raise ValueError(
@@ -101,11 +73,6 @@ class MutationManager:
         return self
 
     def apply_mutation(self) -> "MutationManager":
-        """
-        Aplica mutações iterando sobre FunctionTargets.
-        Cada operador recebe o nó da função (escopo cirúrgico) para
-        analyse_ast e a AST completa do arquivo para build_mutant.
-        """
         if not self.source_asts:
             raise RuntimeError("Chame parse_to_ast() primeiro.")
         if self.work_dir is None:
@@ -113,7 +80,6 @@ class MutationManager:
 
         mutant_dir    = self.work_dir / "mutants"
         mutant_dir.mkdir(parents=True, exist_ok=True)
-        # global_counter = 0
 
         for target in self.config.targets:
             file_ast = self.source_asts.get(target.source_file.resolve())
@@ -121,29 +87,21 @@ class MutationManager:
                 logger.warning(f"AST não encontrada para {target.source_file} — pulando.")
                 continue
 
-            # Subpasta por arquivo fonte — evita colisão de nomes entre targets
-            # ex: mutants/atr/ e mutants/uts/ em vez de tudo em mutants/
             target_mutant_dir = mutant_dir / target.source_file.stem
             target_mutant_dir.mkdir(parents=True, exist_ok=True)
 
-            # Subpasta: mutants/<arquivo_fonte>/<operador>/
-            # ex: mutants/atr/ATR/, mutants/atr/MTR/
             for op_name in self.config.operators:
                 try:
                     operator = self._load_operator(op_name)
                     op_dir = target_mutant_dir / op_name.upper()
                     op_dir.mkdir(parents=True, exist_ok=True)
 
-                    # analyse_ast recebe só o nó da função — escopo cirúrgico
                     eligible_nodes = operator.analyse_ast(target.node)
                     if not eligible_nodes:
                         continue
 
-                    # Marca quantos mutantes havia antes para pegar só os novos
                     before = len(operator.mutant_list)
 
-                    # build_mutant recebe a AST completa do arquivo para gerar
-                    # o arquivo mutante completo e válido
                     operator.build_mutant(
                         nodes=eligible_nodes,
                         original_ast=file_ast,
@@ -151,13 +109,9 @@ class MutationManager:
                         mutant_dir=str(op_dir),
                     )
 
-                    # Pega só os mutantes novos gerados nesta chamada
                     new_mutants = operator.mutant_list[before:]
 
-                    # Propaga mapeamento de testes para cada mutante gerado
                     for m in new_mutants:
-                        # global_counter += 1
-                        # m.id             = global_counter
                         m.test_files     = list(target.test_files)
                         m.test_functions = list(target.test_functions)
 
@@ -177,7 +131,6 @@ class MutationManager:
         return self
 
     def run_tests(self) -> "MutationManager":
-        """Executa testes para todos os mutantes gerados."""
         if not self.mutant_list:
             logger.warning("Nenhum mutante gerado — nada para testar.")
             return self
@@ -190,14 +143,11 @@ class MutationManager:
         return self
 
     def agregate_results(self) -> "MutationManager":
-        """Consolida resultados e gera relatório."""
         if not self.result_list:
             raise RuntimeError("Chame run_tests() primeiro.")
 
         from src.reporter.reporter import Reporter
 
-        # Passa o código do primeiro arquivo fonte para o Reporter
-        # (compatibilidade com o Reporter atual que espera uma string)
         first_source = next(iter(self.source_codes.values()), "")
 
         reporter = Reporter(
@@ -214,7 +164,6 @@ class MutationManager:
         return self
 
     def run(self) -> "MutationManager":
-        """Executa o pipeline completo em uma única chamada."""
         logger.info("Iniciando pipeline de mutação...")
         self.load()
         self.parse_to_ast()
@@ -224,9 +173,6 @@ class MutationManager:
         logger.info(f"Pipeline concluído. Saída em: {self.work_dir}")
         return self
 
-    # ------------------------------------------------------------------ #
-    # Helpers privados                                                     #
-    # ------------------------------------------------------------------ #
 
     def _load_operator(self, op_name: str):
         op_name = op_name.strip().upper()

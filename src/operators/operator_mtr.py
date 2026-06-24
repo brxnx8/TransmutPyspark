@@ -1,13 +1,3 @@
-# src/operators/operator_mtr.py
-"""
-MTR – Mapping Transformation Replacement
-=========================================
-Alvo (DataFrame API):
-  - df.withColumn("col", <expr>)   → muta <expr>
-  - df.select(<expr>, ...)         → muta cada <expr> individualmente
-  - df.map / df.mapInPandas        → muta a função passada
-"""
-
 import ast
 import copy
 from dataclasses import dataclass, field
@@ -80,7 +70,6 @@ class OperatorMTR(Operator):
     _DEFAULT_NAME      = "MTR"
     _DEFAULT_REGISTERS = ["withColumn", "select", "map"]
 
-    # Campos do dataclass com defaults
     id:               int             = 1
     name:             str             = "MTR"
     mutant_registers: str | list[str] = field(

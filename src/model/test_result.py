@@ -2,16 +2,6 @@ from dataclasses import dataclass
 
 @dataclass
 class TestResult:
-    """
-    Dataclass to store the details of tests results.
-
-
-    Attributes:
-        mutant          : Unique identifier for the mutant (id from Mutant dataclass)
-        status          : Killed, Survived, Timeout, etc.
-        failed_tests    : Which tests failed (if applicable)
-        execution_time  : Time taken to execute the tests against the mutant
-    """
     mutant: int
     status: str
     failed_tests: list[str]

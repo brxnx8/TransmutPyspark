@@ -1,17 +1,3 @@
-# src/operators/operator_uts.py
-"""
-UTS – Unary Transformations Swap
-==================================
-Troca a ordem de dois métodos DataFrame dentro de um pipeline encadeado
-quando não há dependência de coluna entre eles.
-
-O parâmetro ``max_distance`` controla até quantas posições de distância
-no pipeline um par pode estar para ser elegível ao swap:
-  - max_distance=1  → apenas pares adjacentes (comportamento original)
-  - max_distance=2  → adjacentes + distância 2
-  - max_distance=-1 → sem limite (todos os pares independentes)
-"""
-
 import ast
 import copy
 from dataclasses import dataclass, field
@@ -44,12 +30,6 @@ def _node_key(node: ast.AST) -> tuple:
 
 
 def _pair_key(pair: "_Pair") -> tuple:
-    """Identifica um par de forma única por ambos os nós.
-
-    Necessário porque com max_distance > 1 o mesmo nó outer pode aparecer
-    em múltiplos pares com inners diferentes — _node_key(outer) sozinho
-    causaria colisão na filtragem de build_mutant.
-    """
     return (_node_key(pair.inner), _node_key(pair.outer))
 
 
@@ -84,16 +64,12 @@ def _columns_created(call: ast.Call) -> set[str]:
 
 def _columns_referenced(call: ast.Call) -> set[str]:
     names: set[str] = set()
-
-    # Pre-computar o conjunto de nos que sao .func de um ast.Call,
-    # para distinguir chamadas de metodo (ex: .filter) de atributos de coluna (ex: df.nome).
     method_func_nodes: set[int] = set()
     for node in ast.walk(call):
         if isinstance(node, ast.Call):
             method_func_nodes.add(id(node.func))
 
     for node in ast.walk(call):
-        # col("nome") ou F.col("nome")
         if isinstance(node, ast.Call):
             func = node.func
             is_col = (
@@ -103,7 +79,6 @@ def _columns_referenced(call: ast.Call) -> set[str]:
             if is_col and node.args and isinstance(node.args[0], ast.Constant):
                 names.add(node.args[0].value)
 
-        # df["nome"]
         elif (
             isinstance(node, ast.Subscript) and
             isinstance(node.slice, ast.Constant) and
@@ -111,7 +86,6 @@ def _columns_referenced(call: ast.Call) -> set[str]:
         ):
             names.add(node.slice.value)
 
-        # df.nome -- apenas atributos que nao sao .func de uma chamada de metodo
         elif (
             isinstance(node, ast.Attribute) and
             isinstance(node.value, ast.Name) and
@@ -127,11 +101,6 @@ def _has_dependency(inner: ast.Call, outer: ast.Call) -> bool:
 
 
 def _extract_pipeline(tree: ast.AST) -> list[ast.Call]:
-    """
-    Retorna todos os nós ast.Call de transformações unárias encontrados
-    na árvore, ordenados pela posição de fim no código-fonte — o que
-    corresponde à ordem de execução do pipeline encadeado.
-    """
     nodes: list[ast.Call] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and _method_name(node) in _UNARY_TRANSFORMS:
@@ -143,31 +112,18 @@ def _extract_pipeline(tree: ast.AST) -> list[ast.Call]:
 def _any_transitive_dependency(
     pipeline: list[ast.Call], i: int, j: int
 ) -> bool:
-    """
-    Retorna True se existir qualquer dependência de coluna que impeça
-    o swap entre os nós de índice i e j no pipeline, incluindo
-    dependências transitivas através dos nós intermediários entre eles.
-    """
     node_i = pipeline[i]
     for k in range(i, j):
         node_k = pipeline[k]
         node_k1 = pipeline[k + 1]
-        # nó k cria coluna que nó k+1 referencia
         if _has_dependency(node_k, node_k1):
             return True
-    # dependência direta entre i e j (pode não ter intermediários)
     if _has_dependency(node_i, pipeline[j]):
         return True
     return False
 
 
 def _find_pairs(tree: ast.AST, max_distance: int = 1) -> list[_Pair]:
-    """
-    Encontra todos os pares elegíveis para swap dentro do pipeline,
-    respeitando max_distance e verificando dependências transitivas.
-
-    max_distance=-1 desativa o limite de distância.
-    """
     pipeline = _extract_pipeline(tree)
     pairs: list[_Pair] = []
 
@@ -187,7 +143,6 @@ def _find_pairs(tree: ast.AST, max_distance: int = 1) -> list[_Pair]:
         if _any_transitive_dependency(pipeline, i, j):
             continue
 
-        # inner = nó de menor índice (executa primeiro), outer = maior índice
         pairs.append(_Pair(
             outer=node_j,
             inner=node_i,
@@ -200,11 +155,6 @@ def _find_pairs(tree: ast.AST, max_distance: int = 1) -> list[_Pair]:
 
 
 def _build_swapped(pair: _Pair, original_ast: ast.AST) -> ast.AST:
-    """
-    Troca o conteúdo (attr + args + keywords) dos dois nós no pipeline,
-    preservando a estrutura de encadeamento do AST intacta.
-    Funciona tanto para pares adjacentes quanto não-adjacentes.
-    """
     mutated = copy.deepcopy(original_ast)
 
     key_inner = _node_key(pair.inner)
@@ -226,7 +176,6 @@ def _build_swapped(pair: _Pair, original_ast: ast.AST) -> ast.AST:
             f"inner={pair.inner_method} outer={pair.outer_method}"
         )
 
-    # Trocar attr (nome do método) + args + keywords entre os dois nós
     node_a.func.attr, node_b.func.attr = node_b.func.attr, node_a.func.attr
     node_a.args,      node_b.args      = node_b.args,      node_a.args
     node_a.keywords,  node_b.keywords  = node_b.keywords,  node_a.keywords

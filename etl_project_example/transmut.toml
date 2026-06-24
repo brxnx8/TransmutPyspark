@@ -1,6 +1,0 @@
-[transmut]
-source_dirs   = ["etl_code/"]
-tests_dirs    = ["etl_test/weak_test/"]
-operators     = ["ATR", "MTR", "NFTP", "UTS"]
-workspace_dir = "."
-# exclude = ["src/utils/logging.py"]   # opcional

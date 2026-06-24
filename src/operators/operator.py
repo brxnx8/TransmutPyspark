@@ -1,39 +1,3 @@
-"""
-Operator
-========
-Abstract base class that defines the interface every mutation operator
-must implement.
-
-Design decisions
-----------------
-- Uses ``ABC`` + ``@abstractmethod`` so that instantiating a subclass that
-  has not implemented ``analyse_ast`` or ``build_mutant`` raises a clear
-  ``TypeError`` immediately.
-- Attributes (``id``, ``name``, ``mutant_registers``, ``mutant_list``) are
-  shared by every concrete operator and validated in ``__post_init__``.
-- ``analyse_ast``  → receives the AST tree directly as a parameter,
-                     analyses it and returns the eligible nodes for mutation.
-- ``build_mutant`` → receives the nodes found by ``analyse_ast``, applies
-                     substitutions on the original tree, generates the mutant
-                     source files, wraps each result in a ``Mutant`` instance,
-                     stores them in ``mutant_list`` and returns the full list.
-
-Relationship with MutationManager
-----------------------------------
-::
-
-    manager.parseToAST(source)                         # builds the AST
-    nodes = operator.analyse_ast(manager.program_ast)  # finds eligible nodes
-    mutants = operator.build_mutant(nodes)             # generates mutants
-    # mutants are also stored in operator.mutant_list
-
-Deliberately out of scope
---------------------------
-- Parsing source code into AST  → MutationManager.parseToAST()
-- Running tests against mutants → TestRunner
-- Reporting results             → Reporter (future)
-"""
-
 import ast
 import logging
 
@@ -48,39 +12,14 @@ from src.model.mutant_id_manager import MutantIDManager
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# Abstract Operator                                                            #
-# ─────────────────────────────────────────────────────────────────────────── #
-
 @dataclass
 class Operator(ABC):
-    """
-    Abstract base class for all mutation operators.
-
-    Attributes
-    ----------
-    id               : int
-        Unique numeric identifier for this operator instance.
-    name             : str
-        Human-readable name for the operator (e.g. ``"AOR"``, ``"ROR"``).
-        Normalised to uppercase on construction.
-    mutant_registers : str | list[str]
-        Metadata describing where/how this operator applies — e.g. a node
-        type name (``"Add"``) or a list of them (``["Lt", "Gt", "LtE"]``).
-        Used by concrete subclasses to guide ``analyse_ast``.
-    mutant_list      : list[Mutant]
-        Accumulator populated by ``build_mutant``.  Empty on construction;
-        grows with each call to ``build_mutant``.
-    """
 
     id:               int
     name:             str
     mutant_registers: str | list[str]
     mutant_list:      list[Mutant] = field(default_factory=list)
 
-    # ------------------------------------------------------------------ #
-    # Post-init validation                                                 #
-    # ------------------------------------------------------------------ #
 
     _id_manager = MutantIDManager()
 
@@ -92,11 +31,6 @@ class Operator(ABC):
 
     @classmethod
     def create(cls) -> "Operator":
-        """
-        Factory sem argumentos usada pelo MutationManager._load_operator().
-        Cada subclasse define _DEFAULT_ID, _DEFAULT_NAME e
-        _DEFAULT_REGISTERS como atributos de classe.
-        """
         return cls(
             id=cls._DEFAULT_ID,
             name=cls._DEFAULT_NAME,
@@ -104,38 +38,10 @@ class Operator(ABC):
         )
 
 
-    # ------------------------------------------------------------------ #
-    # Abstract interface — subclasses MUST implement both methods          #
-    # ------------------------------------------------------------------ #
-
     @abstractmethod
     def analyse_ast(self, tree: ast.AST) -> list[ast.AST]:
-        """
-        Analyse ``tree`` and return every node eligible for mutation.
+        pass
 
-        Implementations must:
-          1. Walk ``tree`` looking for nodes that match this operator's
-             criteria (guided by ``self.mutant_registers``).
-          2. Return the list of matching nodes — these are passed directly
-             to ``build_mutant``.
-
-        Parameters
-        ----------
-        tree : ast.AST
-            The parsed AST of the PySpark program, obtained from
-            ``MutationManager.program_ast``.
-
-        Returns
-        -------
-        list[ast.AST]
-            Nodes eligible for mutation.  Empty list if none found.
-
-        Raises
-        ------
-        TypeError
-            If ``tree`` is not an ``ast.AST`` instance.
-        """
-        ...
 
     @abstractmethod
     def build_mutant(self,
@@ -143,59 +49,10 @@ class Operator(ABC):
                      original_ast: ast.AST,
                      original_path: str,
                      mutant_dir: str) -> list[Mutant]:
-        """
-        Generate one ``Mutant`` per node, write each to disk and populate
-        ``self.mutant_list``.
+        pass
 
-        For each node in ``nodes``, implementations must:
-          1. Deep-copy ``original_ast``.
-          2. Replace the target node with the appropriate substitute.
-          3. Unparse the modified tree back to source code.
-          4. Write the mutated source to a ``.py`` file inside
-             ``mutant_dir``.
-          5. Record the modified line.
-          6. Create a ``Mutant`` instance and append it to
-             ``self.mutant_list``.
-
-        At the end return ``self.mutant_list``.
-
-        Parameters
-        ----------
-        nodes : list[ast.AST]
-            Eligible nodes returned by ``analyse_ast``.
-        original_ast : ast.AST
-            The unmodified program AST (must not be mutated in place).
-        original_path : str
-            Absolute path to the original PySpark source file — stored in
-            each ``Mutant.original_path``.
-        mutant_dir : str
-            Directory where mutant ``.py`` files will be written.
-
-        Returns
-        -------
-        list[Mutant]
-            The full ``self.mutant_list`` after appending the new mutants.
-
-        Raises
-        ------
-        TypeError
-            If ``nodes`` is not a list or contains non-``ast.AST`` items.
-        ValueError
-            If ``original_path`` or ``mutant_dir`` is not a non-empty string.
-        """
-        ...
-
-    # ------------------------------------------------------------------ #
-    # Concrete helpers available to all subclasses                         #
-    # ------------------------------------------------------------------ #
 
     def clear_mutant_list(self) -> None:
-        """
-        Empty ``mutant_list`` without touching any other attribute.
-
-        Useful when reusing the same operator instance across multiple
-        mutation rounds.
-        """
         self.mutant_list.clear()
         logger.info(f"[Operator:{self.name}] mutant_list cleared.")
 
@@ -206,12 +63,6 @@ class Operator(ABC):
         target: ast.AST,
         replacement: ast.AST,
     ) -> ast.AST:
-        """
-        Clona original_ast, substitui target por replacement e retorna
-        a árvore modificada. O target é localizado por posição (lineno +
-        col_offset + tipo) para sobreviver ao deepcopy.
-        """
-        # Fingerprint do nó alvo — sobrevive ao deepcopy
         target_type    = type(target)
         target_lineno  = getattr(target, "lineno",     None)
         target_col     = getattr(target, "col_offset", None)
@@ -240,79 +91,34 @@ class Operator(ABC):
         mutant_dir: str,
         filename: str,
     ) -> str:
-        """
-        Grava o mutante em mutant_dir/filename.
-        Retorna o caminho absoluto do arquivo gerado.
-        """
         source = ast.unparse(mutated_ast)
         path = Path(mutant_dir) / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source, encoding="utf-8")
         return str(path.resolve())
 
-    # ------------------------------------------------------------------ #
-    # Logging helpers — centralized log output for all operators           #
-    # ------------------------------------------------------------------ #
-
     def _log_analyse_ast_found(self, count: int, description: str) -> None:
-        """
-        Log the number of eligible nodes found by ``analyse_ast``.
-
-        Parameters
-        ----------
-        count : int
-            Number of eligible nodes found.
-        description : str
-            Human-readable description of what was searched for.
-            Example: "mapping transformation calls with function arguments"
-        """
         logger.info(
             f"[{self.__class__.__name__}.analyse_ast] Found {count} eligible "
             f"call site(s) ({description})."
         )
 
     def _log_skipping_node(self, reason: str) -> None:
-        """
-        Log that a node or sub-node is being skipped due to validation failure.
-
-        Parameters
-        ----------
-        reason : str
-            Human-readable reason why this node is being skipped.
-            Example: "Call at line 42: no eligible sub-conditions found"
-        """
         logger.warning(f"[{self.__class__.__name__}.build_mutant] {reason} — skipping.")
 
     def _log_mutant_created(self, mutant_id: int, details: str) -> None:
-        """
-        Log that a mutant was successfully created.
-
-        Parameters
-        ----------
-        mutant_id : int
-            The numeric ID of the mutant.
-        details : str
-            Extra details about the mutation.
-            Example: "call line 9 (.withColumn), replacement 'zero': ...[subdir/file.py]"
-        """
         logger.info(
             f"[{self.__class__.__name__}.build_mutant] Mutant {mutant_id} created "
             f"— {details}"
         )
 
     def _log_build_mutant_done(self) -> None:
-        """Log the completion of ``build_mutant`` with the final mutant count."""
         logger.info(
             f"[{self.__class__.__name__}.build_mutant] Done — "
             f"{len(self.mutant_list)} total mutant(s) generated."
         )
 
-    # ------------------------------------------------------------------ #
-    # Protected guards — call these inside subclass implementations        #
-    # ------------------------------------------------------------------ #
-
     def _assert_valid_tree(self, tree: ast.AST) -> None:
-        """Raise ``TypeError`` if ``tree`` is not an ``ast.AST`` instance."""
         if not isinstance(tree, ast.AST):
             raise TypeError(
                 f"[Operator:{self.name}] tree must be an ast.AST instance, "
@@ -320,7 +126,6 @@ class Operator(ABC):
             )
 
     def _assert_valid_nodes(self, nodes: list[ast.AST]) -> None:
-        """Raise ``TypeError`` if ``nodes`` is not a list of AST nodes."""
         if not isinstance(nodes, list):
             raise TypeError(
                 f"[Operator:{self.name}] nodes must be a list, "
@@ -334,7 +139,6 @@ class Operator(ABC):
             )
 
     def _assert_valid_path(self, path: str, param_name: str) -> None:
-        """Raise ``ValueError`` if ``path`` is not a non-empty string."""
         if not isinstance(path, str) or not path.strip():
             raise ValueError(
                 f"[Operator:{self.name}] {param_name} must be a non-empty "
@@ -343,10 +147,6 @@ class Operator(ABC):
 
     def _next_mutant_id(self) -> int:
         return self._id_manager.next_id()
-
-    # ------------------------------------------------------------------ #
-    # Private validators                                                   #
-    # ------------------------------------------------------------------ #
 
     def _validate_id(self) -> None:
         if not isinstance(self.id, int) or self.id < 0:
@@ -404,9 +204,6 @@ class Operator(ABC):
                 f"Mutant instances. Invalid entries: {invalid}"
             )
 
-    # ------------------------------------------------------------------ #
-    # Dunder helpers                                                       #
-    # ------------------------------------------------------------------ #
 
     def __repr__(self) -> str:
         return (

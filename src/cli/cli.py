@@ -1,13 +1,3 @@
-"""
-cli.py
-======
-Entry point da ferramenta transmut.
-
-Comandos disponíveis:
-  transmut run    — executa o pipeline de mutação
-  transmut init   — cria transmut.toml guiado
-  transmut show   — abre o último report.html no browser
-"""
 from __future__ import annotations
 
 import argparse
@@ -36,7 +26,6 @@ exemplos:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # ── transmut run ──────────────────────────────────────────────────
     run = sub.add_parser("run", help="Executa o pipeline de mutação")
 
     src_group = run.add_argument_group("fontes (escolha uma forma)")
@@ -71,7 +60,6 @@ exemplos:
         help="Ativa logs detalhados",
     )
 
-    # ── transmut init ─────────────────────────────────────────────────
     init = sub.add_parser("init", help="Cria transmut.toml com configuração padrão")
     init.add_argument("--src",   metavar="PATH", default="src/",
                       help="Diretório do código fonte (default: src/)")
@@ -80,7 +68,6 @@ exemplos:
     init.add_argument("--output", metavar="DIR", default=".",
                       help="Diretório de saída (default: .)")
 
-    # ── transmut show ─────────────────────────────────────────────────
     sub.add_parser("show", help="Abre o último report.html no browser")
 
     return parser
@@ -100,12 +87,7 @@ def main() -> None:
         _cmd_show()
 
 
-# ─────────────────────────────────────────────────────────────────────── #
-# Comandos                                                                 #
-# ─────────────────────────────────────────────────────────────────────── #
-
 def _cmd_run(args: argparse.Namespace) -> None:
-    """Resolve a fonte de config e dispara o MutationManager."""
     from src.mutation_manager import MutationManager
 
     config_input = _resolve_config_input(args)
@@ -115,7 +97,6 @@ def _cmd_run(args: argparse.Namespace) -> None:
         manager = MutationManager(config_input)
         manager.run()
 
-        # Resumo no terminal
         total    = len(manager.mutant_list)
         killed   = sum(1 for r in manager.result_list if r.status == "killed")
         score    = round(killed / total * 100, 1) if total else 0
@@ -140,7 +121,6 @@ def _cmd_run(args: argparse.Namespace) -> None:
 
 
 def _cmd_init(args: argparse.Namespace) -> None:
-    """Cria transmut.toml no diretório atual."""
     toml_path = Path("transmut.toml")
     if toml_path.exists():
         print("transmut.toml já existe. Remova-o antes de rodar 'init'.")
@@ -160,8 +140,6 @@ def _cmd_init(args: argparse.Namespace) -> None:
 
 
 def _cmd_show() -> None:
-    """Abre o último relatório no browser."""
-    # Procura qualquer report*.html dentro de TransmutPysparkOutput
     candidates = [
         p for p in sorted(Path(".").rglob("*.html"))
         if "TransmutPysparkOutput" in str(p) and p.stem.startswith("report")
@@ -174,25 +152,14 @@ def _cmd_show() -> None:
             "  Rode 'transmut run' primeiro para gerar o relatório."
         )
 
-    # Pega o mais recente (por nome — o timestamp garante ordenação correta)
     report = sorted(candidates)[-1].resolve()
     print(f"Abrindo: {report}")
     webbrowser.open(report.as_uri())
 
 
-# ─────────────────────────────────────────────────────────────────────── #
-# Helpers                                                                  #
-# ─────────────────────────────────────────────────────────────────────── #
 
 def _resolve_config_input(args: argparse.Namespace) -> str | dict:
-    """
-    Determina a fonte de configuração na ordem de prioridade:
-      1. --src + --tests (flags diretas)
-      2. --config explícito
-      3. transmut.toml na raiz
-      4. config.txt na raiz
-    """
-    # Modo A: flags diretas
+
     if args.src and args.tests:
         return {
             "program_path":  args.src,
@@ -201,18 +168,15 @@ def _resolve_config_input(args: argparse.Namespace) -> str | dict:
             "workspace_dir": args.output,
         }
 
-    # Modo B/C: arquivo de config explícito
     if args.config:
         p = Path(args.config)
         if not p.exists():
             _die(f"Arquivo de config não encontrado: {args.config}")
         return str(p)
 
-    # Modo B: transmut.toml automático
     if Path("transmut.toml").exists():
         return "transmut.toml"
 
-    # Modo C: config.txt legado
     if Path("config.txt").exists():
         return "config.txt"
 
@@ -228,7 +192,6 @@ def _setup_logging(verbose: bool = False) -> None:
         level=level,
         format="%(levelname)s | %(name)s | %(message)s",
     )
-    # Sempre mostra INFO do MutationManager (progresso do pipeline)
     logging.getLogger("src.mutation_manager").setLevel(logging.INFO)
     logging.getLogger("src.config.ast_analyzer").setLevel(logging.INFO)
     logging.getLogger("src.test_module.test_runner").setLevel(logging.INFO)
