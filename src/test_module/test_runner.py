@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +28,9 @@ class TestRunner:
         if self.max_workers < 1:
             raise ValueError(f"max_workers deve ser >= 1, recebeu: {self.max_workers}")
 
+    # ------------------------------------------------------------------ #
+    # API pública                                                          #
+    # ------------------------------------------------------------------ #
 
     def run_test(self) -> list[TestResult]:
         if not self.mutant_list:
@@ -78,6 +82,9 @@ class TestRunner:
         )
         return self.results
 
+    # ------------------------------------------------------------------ #
+    # Execução de mutante individual                                       #
+    # ------------------------------------------------------------------ #
 
     def _run_single_mutant(self, mutant, sandbox_root: Path) -> TestResult:
         mutant_path   = Path(mutant.mutant_path)
@@ -96,11 +103,9 @@ class TestRunner:
             original_source_dir=Path(mutant.original_path).parent,
         )
 
-        # FIX: Se não há testes mapeados, mutante sobrevive (não é exercitado)
-        if mutant.test_files:
-            test_paths = [str(tf) for tf in mutant.test_files]
-        else:
-            logger.debug(f"Mutant {mutant.id}: Nenhum teste mapeado — classificado como survived")
+        # Se não há testes mapeados, mutante não é exercitado → survived
+        if not mutant.test_files:
+            logger.debug(f"Mutant {mutant.id}: Nenhum teste mapeado — survived")
             return TestResult(
                 mutant=mutant.id,
                 status="survived",
@@ -108,8 +113,15 @@ class TestRunner:
                 execution_time=0.0,
             )
 
-        import sys
-        cmd = [sys.executable, "-m", "pytest", *test_paths, "-x", "-q", "--tb=short"]
+        test_paths = [str(tf) for tf in mutant.test_files]
+
+        cmd = [
+            sys.executable, "-m", "pytest",
+            *test_paths,
+            "-x", "-q", "--tb=short",
+            "--import-mode=importlib",
+            #f"--rootdir={self.config.workspace_dir}",
+        ]
 
         if mutant.test_functions:
             k_expr = " or ".join(mutant.test_functions)
@@ -121,19 +133,28 @@ class TestRunner:
                 cmd,
                 capture_output=True,
                 text=True,
-                encoding='utf-8',
-                errors='replace',
+                encoding="utf-8",
+                errors="replace",
                 env=env,
                 timeout=120,
             )
-            duration     = time.perf_counter() - start
-            status       = self._classify(proc.returncode)
-            failed_tests = self._extract_failed_tests(proc.stdout or "")
+            duration = time.perf_counter() - start
+            stdout   = proc.stdout or ""
+            stderr   = proc.stderr or ""
 
+            # Loga sempre em INFO para facilitar diagnóstico
             logger.debug(
-                f"Mutant {mutant.id}: {status} "
-                f"({duration:.2f}s, exit={proc.returncode})"
+                f"Mutant {mutant.id} | exit={proc.returncode} | "
+                f"stdout: {stdout[:500]!r}"
             )
+            if proc.returncode not in (0, 1, 5):
+                logger.warning(
+                    f"Mutant {mutant.id} | stderr: {stderr[:500]!r}"
+                )
+
+            status       = self._classify(proc.returncode, stdout)
+            failed_tests = self._extract_failed_tests(stdout)
+
             return TestResult(
                 mutant=mutant.id,
                 status=status,
@@ -142,7 +163,9 @@ class TestRunner:
             )
 
         except subprocess.TimeoutExpired:
+            # proc não existe aqui — não tentar acessá-lo
             duration = time.perf_counter() - start
+            logger.warning(f"Mutant {mutant.id}: timeout após {duration:.1f}s")
             return TestResult(
                 mutant=mutant.id,
                 status="timeout",
@@ -152,9 +175,12 @@ class TestRunner:
         finally:
             shutil.rmtree(sandbox_dir, ignore_errors=True)
 
+    # ------------------------------------------------------------------ #
+    # Helpers                                                              #
+    # ------------------------------------------------------------------ #
+
     @staticmethod
     def _build_env(sandbox_dir: Path, original_source_dir: Path | None = None) -> dict:
-        import sys
         env = os.environ.copy()
 
         python_bin_dir = str(Path(sys.executable).parent)
@@ -164,7 +190,6 @@ class TestRunner:
 
         current_pythonpath = env.get("PYTHONPATH", "").strip()
 
-        # Sandbox primeiro (mutante), depois original_source_dir (para imports da função)
         parts = [str(sandbox_dir)]
         if original_source_dir and str(original_source_dir) not in current_pythonpath:
             parts.append(str(original_source_dir))
@@ -175,12 +200,14 @@ class TestRunner:
         return env
 
     @staticmethod
-    def _classify(exit_code: int) -> str:
-        if exit_code == 0:
+    def _classify(exit_code: int, stdout: str = "") -> str:
+        if exit_code == 0 or exit_code == 5:
             return "survived"
         if exit_code == 1:
-            return "killed"
-        if exit_code == 5:
+            if "FAILED" in stdout:
+                return "killed"
+            if "ERROR" in stdout:
+                return "error"
             return "error"
         return "error"
 

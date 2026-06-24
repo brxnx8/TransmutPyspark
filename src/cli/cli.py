@@ -99,12 +99,16 @@ def _cmd_run(args: argparse.Namespace) -> None:
 
         total    = len(manager.mutant_list)
         killed   = sum(1 for r in manager.result_list if r.status == "killed")
-        score    = round(killed / total * 100, 1) if total else 0
-        survived = total - killed
+        errors = sum(1 for r in manager.result_list if r.status == "error")
+        timeouts = sum(1 for r in manager.result_list if r.status == "timeout")
+        survived = total - killed - errors - timeouts
 
-        print(f"\n{'━'*50}")
-        print(f"  Mutation Score : {score}%  ({killed} killed / {total} total)")
+        exercised = killed + survived  # só os que foram realmente testados
+        score = round(killed / exercised * 100, 1) if exercised else 0
+
+        print(f"  Mutation Score : {score}%  ({killed} killed / {exercised} exercised)")
         print(f"  Sobreviventes  : {survived} mutante(s) não detectados")
+        print(f"  Erros/Timeouts : {errors + timeouts} mutante(s) com falha de infraestrutura")
         print(f"  Relatório      : {manager.work_dir}/report.html")
         print(f"{'━'*50}\n")
 
