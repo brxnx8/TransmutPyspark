@@ -65,17 +65,23 @@ class TestRunner:
         survived = sum(1 for r in self.results if r.status == "survived")
         timeouts = sum(1 for r in self.results if r.status == "timeout")
         errors   = sum(1 for r in self.results if r.status == "error")
+
+        exercised = killed + survived
+        mutation_score = (killed / exercised * 100) if exercised > 0 else 0.0
+
         logger.info(
             f"[TestRunner] Concluído — "
             f"killed={killed}, survived={survived}, "
-            f"timeout={timeouts}, error={errors}"
+            f"timeout={timeouts}, error={errors} | "
+            f"mutation score={mutation_score:.1f}% "
+            f"({killed}/{exercised} mutantes exercitados)"
         )
         return self.results
 
 
     def _run_single_mutant(self, mutant, sandbox_root: Path) -> TestResult:
         mutant_path   = Path(mutant.mutant_path)
-        original_name = Path(mutant.original_path).name   # ex: uts.py
+        original_name = Path(mutant.original_path).name
 
         sandbox_dir = sandbox_root / f"sandbox_{mutant.id}"
         sandbox_dir.mkdir(exist_ok=True)
@@ -90,13 +96,19 @@ class TestRunner:
             original_source_dir=Path(mutant.original_path).parent,
         )
 
+        # FIX: Se não há testes mapeados, mutante sobrevive (não é exercitado)
         if mutant.test_files:
             test_paths = [str(tf) for tf in mutant.test_files]
         else:
-            test_paths = [str(tf) for tf in self.config.test_files]
+            logger.debug(f"Mutant {mutant.id}: Nenhum teste mapeado — classificado como survived")
+            return TestResult(
+                mutant=mutant.id,
+                status="survived",
+                failed_tests=[],
+                execution_time=0.0,
+            )
 
         import sys
-
         cmd = [sys.executable, "-m", "pytest", *test_paths, "-x", "-q", "--tb=short"]
 
         if mutant.test_functions:
@@ -152,6 +164,7 @@ class TestRunner:
 
         current_pythonpath = env.get("PYTHONPATH", "").strip()
 
+        # Sandbox primeiro (mutante), depois original_source_dir (para imports da função)
         parts = [str(sandbox_dir)]
         if original_source_dir and str(original_source_dir) not in current_pythonpath:
             parts.append(str(original_source_dir))
@@ -167,6 +180,8 @@ class TestRunner:
             return "survived"
         if exit_code == 1:
             return "killed"
+        if exit_code == 5:
+            return "error"
         return "error"
 
     @staticmethod

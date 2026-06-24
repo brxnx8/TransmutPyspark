@@ -2,20 +2,28 @@ import ast
 import copy
 from dataclasses import dataclass, field
 from typing import cast
-from pathlib import Path
 
 from src.model.mutant import Mutant
 from src.operators.operator import Operator
 
 _MAPPING_METHODS = {"withColumn", "select", "map", "mapInPandas", "mapInArrow"}
 
-_LITERAL_REPLACEMENTS: dict[str, ast.expr] = {
-    "zero":      ast.Constant(value=0),
-    "one":       ast.Constant(value=1),
-    "neg_one":   ast.Constant(value=-1),
-    "none":      ast.Constant(value=None),
-    "empty_str": ast.Constant(value=""),
-}
+def _make_lit_call(value: object) -> ast.Call:
+    return ast.Call(
+        func=ast.Name(id="lit", ctx=ast.Load()),
+        args=[ast.Constant(value=value)],
+        keywords=[],
+    )
+
+
+def _literal_replacements() -> dict[str, ast.expr]:
+    return {
+        "zero":      _make_lit_call(0),
+        "one":       _make_lit_call(1),
+        "neg_one":   _make_lit_call(-1),
+        "none":      _make_lit_call(None),
+        "empty_str": _make_lit_call(""),
+    }
 
 
 def _method_name(call: ast.Call) -> str | None:
@@ -108,7 +116,7 @@ class OperatorMTR(Operator):
             method = _method_name(call_node) or "unknown"
 
             for expr_idx, original_expr in enumerate(target_exprs):
-                substitutes: dict[str, ast.expr] = dict(_LITERAL_REPLACEMENTS)
+                substitutes: dict[str, ast.expr] = _literal_replacements()
 
                 identity = _make_identity(original_expr)
                 if identity is not None:
