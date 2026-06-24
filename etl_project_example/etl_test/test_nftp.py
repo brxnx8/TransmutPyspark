@@ -1,24 +1,48 @@
+import os
+import sys
+import ctypes
 import pytest
+import pyspark
 from pyspark.sql import SparkSession, Row
 from pyspark.sql.functions import col
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 from pyspark.testing.utils import assertDataFrameEqual
-from etl_project_example.etl_code.etl import nftp_function
+from nftp import nftp_function
+
+
+# ── Fixture Spark ─────────────────────────────────────────────────────────────
+
+def _short_path(path):
+    """Converte caminho para formato 8.3 (evita espaços e acentos)."""
+    buf = ctypes.create_unicode_buffer(260)
+    ret = ctypes.windll.kernel32.GetShortPathNameW(path, buf, 260)
+    if ret == 0:
+        return path
+    return buf.value
 
 
 @pytest.fixture(scope="session")
 def spark():
-    # Inicialização limpa e moderna
-    spark_session = (SparkSession.builder
-        .master("local[1]")
-        .appName("pytest-pyspark-local")
-        .config("spark.ui.enabled", "false")
-        .getOrCreate())
+    # 1. SPARK_HOME usando o pacote pyspark (caminho curto)
+    pyspark_home = os.path.dirname(pyspark.__file__)
+    os.environ["SPARK_HOME"] = _short_path(pyspark_home)
 
+    # 2. Evitar problema com underscore no hostname
+    os.environ["SPARK_LOCAL_HOSTNAME"] = "localhost"
+
+    # 3. 🎯 Força o Spark a usar o Python do ambiente virtual da sandbox
+    #    (resolve "Python não foi encontrado" e timeouts do worker)
+    os.environ["PYSPARK_PYTHON"] = sys.executable
+
+    spark_session = (
+        SparkSession.builder
+        .master("local[1]")
+        .appName("pytest-pyspark-mtr-weak")
+        .config("spark.ui.enabled", "false")
+        .getOrCreate()
+    )
     yield spark_session
     spark_session.stop()
-
-
 
 def test_nftp_function_filtros_e_limites(spark):
     # 1. Preparação (Arrange)

@@ -1,0 +1,4 @@
+program_path = /workspaces/TransmutPyspark/etl_project_example/etl_code/uts.py
+tests_path   = /workspaces/TransmutPyspark/etl_project_example/etl_test/test_uts.py
+operators_list = MTR, NFTP, ATR, UTS
+workspace_dir = /workspaces/TransmutPyspark/etl_project_example/
