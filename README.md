@@ -16,7 +16,6 @@ Um mutante **sobrevivente** indica um caso de teste que está faltando na sua su
 
 ## Sumário
 
-- [Instalação via pip](#instalação-via-pip)
 - [Instalação via git clone](#instalação-via-git-clone)
 - [Início rápido](#início-rápido)
 - [Estrutura esperada do projeto](#estrutura-esperada-do-projeto)
@@ -29,24 +28,6 @@ Um mutante **sobrevivente** indica um caso de teste que está faltando na sua su
 - [Contribuindo — adicionando novos operadores](#contribuindo--adicionando-novos-operadores)
 - [Referência de comandos](#referência-de-comandos)
 - [Requisitos](#requisitos)
-
----
-
-## Instalação via pip
-
-```bash
-pipx install transmutpyspark
-```
-
-> **Recomendado:** `pipx` gerencia o ambiente automaticamente e expõe o comando `transmut` no PATH sem precisar ativar nenhum venv.
->
-> Se não tiver pipx: `sudo apt install pipx && pipx ensurepath`
-
-Alternativa com pip:
-
-```bash
-pip install transmutpyspark
-```
 
 ---
 
@@ -73,10 +54,18 @@ source .venv/bin/activate
 **3. Instale em modo editável**
 
 ```bash
+pip install -r requirements.txt
+```
+
+```bash
 pip install -e .
 ```
 
 O modo `-e` (editable) faz com que qualquer alteração no código fonte seja refletida imediatamente sem reinstalar — ideal para desenvolvimento. O comando `transmut` ficará disponível enquanto o venv estiver ativo.
+
+```bash
+echo "alias transmut='path_projeto/.venv/bin/transmut'"
+```
 
 **4. Confirme a instalação**
 
@@ -442,44 +431,6 @@ Mutation Score = mutantes killed / total de mutantes
 | < 50% | **WEAK** | Testes insuficientes — mutações passam sem ser detectadas |
 
 **Como usar os resultados:** filtre os mutantes com status `SURVIVED` no relatório. O diff mostra exatamente o que foi alterado — escreva um teste que falhe com aquela alteração e passe com o código original.
-
----
-
-## Integração com CI
-
-```yaml
-# .github/workflows/mutation.yml
-name: Mutation Testing
-
-on:
-  pull_request:
-    paths: ["etl_code/**", "tests/**"]
-
-jobs:
-  mutation:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: actions/setup-java@v4
-        with:
-          java-version: "11"
-          distribution: "temurin"
-
-      - run: pip install transmutpyspark
-
-      - run: transmut run --src etl_code/ --tests tests/
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: mutation-report
-          path: TransmutPysparkOutput/report.html
-```
 
 ---
 

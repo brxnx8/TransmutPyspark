@@ -28,9 +28,6 @@ class TestRunner:
         if self.max_workers < 1:
             raise ValueError(f"max_workers deve ser >= 1, recebeu: {self.max_workers}")
 
-    # ------------------------------------------------------------------ #
-    # API pública                                                          #
-    # ------------------------------------------------------------------ #
 
     def run_test(self) -> list[TestResult]:
         if not self.mutant_list:
@@ -82,9 +79,6 @@ class TestRunner:
         )
         return self.results
 
-    # ------------------------------------------------------------------ #
-    # Execução de mutante individual                                       #
-    # ------------------------------------------------------------------ #
 
     def _run_single_mutant(self, mutant, sandbox_root: Path) -> TestResult:
         mutant_path   = Path(mutant.mutant_path)
@@ -103,7 +97,6 @@ class TestRunner:
             original_source_dir=Path(mutant.original_path).parent,
         )
 
-        # Se não há testes mapeados, mutante não é exercitado → survived
         if not mutant.test_files:
             logger.debug(f"Mutant {mutant.id}: Nenhum teste mapeado — survived")
             return TestResult(
@@ -142,7 +135,6 @@ class TestRunner:
             stdout   = proc.stdout or ""
             stderr   = proc.stderr or ""
 
-            # Loga sempre em INFO para facilitar diagnóstico
             logger.debug(
                 f"Mutant {mutant.id} | exit={proc.returncode} | "
                 f"stdout: {stdout[:500]!r}"
@@ -175,9 +167,6 @@ class TestRunner:
         finally:
             shutil.rmtree(sandbox_dir, ignore_errors=True)
 
-    # ------------------------------------------------------------------ #
-    # Helpers                                                              #
-    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _build_env(sandbox_dir: Path, original_source_dir: Path | None = None) -> dict:
