@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TestRunner:
     mutant_list: list
-    config:      object      # ResolvedConfig
+    config:      object
     max_workers: int = field(
         default_factory=lambda: min(4, os.cpu_count() or 1)
     )
@@ -27,7 +28,6 @@ class TestRunner:
             raise TypeError(f"mutant_list deve ser lista, recebeu: {type(self.mutant_list)}")
         if self.max_workers < 1:
             raise ValueError(f"max_workers deve ser >= 1, recebeu: {self.max_workers}")
-
 
     def run_test(self) -> list[TestResult]:
         if not self.mutant_list:
@@ -42,10 +42,23 @@ class TestRunner:
         sandbox_root = self.config.workspace_dir / "TransmutPysparkOutput" / "sandboxes"
         sandbox_root.mkdir(parents=True, exist_ok=True)
 
+        worker_sandboxes: dict[int, Path] = {}
+        for i in range(self.max_workers):
+            sb = sandbox_root / f"worker_{i}_sandbox"
+            sb.mkdir(exist_ok=True)
+            worker_sandboxes[i] = sb
+
+        worker_index = 0
+        lock = threading.Lock()
+
         futures_map: dict = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             for mutant in self.mutant_list:
-                future = executor.submit(self._run_single_mutant, mutant, sandbox_root)
+                with lock:
+                    idx = worker_index
+                    worker_index = (worker_index + 1) % self.max_workers
+                sandbox = worker_sandboxes[idx]
+                future = executor.submit(self._run_single_mutant, mutant, sandbox)
                 futures_map[future] = mutant
 
             for future in as_completed(futures_map):
@@ -61,6 +74,9 @@ class TestRunner:
                     )
                     logger.error(f"[TestRunner] Mutant {mutant.id} crash: {exc}")
                 self.results.append(result)
+
+        for sb in worker_sandboxes.values():
+            shutil.rmtree(sb, ignore_errors=True)
 
         killed   = sum(1 for r in self.results if r.status == "killed")
         survived = sum(1 for r in self.results if r.status == "survived")
@@ -79,21 +95,17 @@ class TestRunner:
         )
         return self.results
 
-
-    def _run_single_mutant(self, mutant, sandbox_root: Path) -> TestResult:
+    def _run_single_mutant(self, mutant, sandbox: Path) -> TestResult:
         mutant_path   = Path(mutant.mutant_path)
         original_name = Path(mutant.original_path).name
 
-        sandbox_dir = sandbox_root / f"sandbox_{mutant.id}"
-        sandbox_dir.mkdir(exist_ok=True)
-
-        target_file = sandbox_dir / original_name
+        target_file = sandbox / original_name
         target_file.write_text(
             mutant_path.read_text(encoding="utf-8"), encoding="utf-8"
         )
 
         env = self._build_env(
-            sandbox_dir,
+            sandbox,
             original_source_dir=Path(mutant.original_path).parent,
         )
 
@@ -108,12 +120,13 @@ class TestRunner:
 
         test_paths = [str(tf) for tf in mutant.test_files]
 
+        project_root = self.config.workspace_dir
         cmd = [
             sys.executable, "-m", "pytest",
             *test_paths,
             "-x", "-q", "--tb=short",
             "--import-mode=importlib",
-            #f"--rootdir={self.config.workspace_dir}",
+            f"--rootdir={project_root}",
         ]
 
         if mutant.test_functions:
@@ -155,7 +168,6 @@ class TestRunner:
             )
 
         except subprocess.TimeoutExpired:
-            # proc não existe aqui — não tentar acessá-lo
             duration = time.perf_counter() - start
             logger.warning(f"Mutant {mutant.id}: timeout após {duration:.1f}s")
             return TestResult(
@@ -164,8 +176,6 @@ class TestRunner:
                 failed_tests=[],
                 execution_time=round(duration, 4),
             )
-        finally:
-            shutil.rmtree(sandbox_dir, ignore_errors=True)
 
 
     @staticmethod
@@ -178,7 +188,6 @@ class TestRunner:
             env["PATH"] = python_bin_dir + os.pathsep + current_path
 
         current_pythonpath = env.get("PYTHONPATH", "").strip()
-
         parts = [str(sandbox_dir)]
         if original_source_dir and str(original_source_dir) not in current_pythonpath:
             parts.append(str(original_source_dir))
