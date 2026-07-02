@@ -57,11 +57,12 @@ class Reporter:
         survived = sum(1 for r in self.result_list if r.status == "survived")
         timeout  = sum(1 for r in self.result_list if r.status == "timeout")
         error    = sum(1 for r in self.result_list if r.status == "error")
+        no_tests_collected = sum(1 for r in self.result_list if r.status == "no_tests_collected")
         score    = round(killed / total, 4) if total > 0 else 0.0
 
         mutant_index = {m.id: m for m in self.mutant_list}
         by_operator: dict[str, dict] = defaultdict(lambda: {
-            "killed": 0, "survived": 0, "timeout": 0, "error": 0, "total": 0
+            "killed": 0, "survived": 0, "timeout": 0, "error": 0, "total": 0, "no_tests_collected": 0
         })
         for result in self.result_list:
             mutant = mutant_index.get(result.mutant)
@@ -77,12 +78,13 @@ class Reporter:
             "survived":           survived,
             "timeout":            timeout,
             "error":              error,
+            "no_tests_collected": no_tests_collected,
             "by_operator":        dict(by_operator),
             "diff_original_code": [],
         })
         logger.info(
             f"[Reporter.calculate] MutationScore={score:.2%} | "
-            f"killed={killed} survived={survived} timeout={timeout} error={error} total={total}"
+            f"killed={killed} survived={survived} timeout={timeout} error={error} total={total} no_tests_collected={no_tests_collected}"
         )
         return self
 
@@ -153,6 +155,7 @@ class Reporter:
         survived_pct = rc.get("survived", 0) / total * 100 if total else 0
         timeout_pct  = rc.get("timeout",  0) / total * 100 if total else 0
         error_pct    = rc.get("error",    0) / total * 100 if total else 0
+        no_tests_collected_pct = rc.get("no_tests_collected", 0) / total * 100 if total else 0
 
         by_file: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
         for mutant in self.mutant_list:
@@ -166,6 +169,7 @@ class Reporter:
             f_survived  = sum(1 for m in all_mutants if result_index.get(m.id) and result_index[m.id].status == "survived")
             f_timeout   = sum(1 for m in all_mutants if result_index.get(m.id) and result_index[m.id].status == "timeout")
             f_error     = sum(1 for m in all_mutants if result_index.get(m.id) and result_index[m.id].status == "error")
+            f_no_tests_collected = sum(1 for m in all_mutants if result_index.get(m.id) and result_index[m.id].status == "no_tests_collected")
             f_ratio     = f_killed / f_total if f_total else 0
             f_score     = f"{f_ratio * 100:.0f}%"
             f_color     = "#22d3a5" if f_ratio == 1.0 else "#f59e0b" if f_ratio >= 0.5 else "#f43f5e"
@@ -177,6 +181,7 @@ class Reporter:
                 op_surv    = sum(1 for m in op_mutants if result_index.get(m.id) and result_index[m.id].status == "survived")
                 op_timeout = sum(1 for m in op_mutants if result_index.get(m.id) and result_index[m.id].status == "timeout")
                 op_error   = sum(1 for m in op_mutants if result_index.get(m.id) and result_index[m.id].status == "error")
+                op_no_tests_collected = sum(1 for m in op_mutants if result_index.get(m.id) and result_index[m.id].status == "no_tests_collected")
                 op_ratio   = op_killed / op_total if op_total else 0
                 op_score   = f"{op_ratio * 100:.0f}%"
                 op_color   = "#22d3a5" if op_ratio == 1.0 else "#f59e0b" if op_ratio >= 0.5 else "#f43f5e"
@@ -255,6 +260,7 @@ class Reporter:
                         <span class="pill pill-survived">{op_surv}S</span>
                         <span class="pill pill-timeout">{op_timeout}T</span>
                         <span class="pill pill-error">{op_error}E</span>
+                        <span class="pill pill-no_tests_collected">{op_no_tests_collected}NT</span>
                         <span class="op-score-val" style="color:{op_color}">{op_score}</span>
                         <span class="op-toggle-chev" id="opchev-{uid}">▶</span>
                       </div>
@@ -282,6 +288,7 @@ class Reporter:
                     <span class="pill pill-survived">{f_survived}S</span>
                     <span class="pill pill-timeout">{f_timeout}T</span>
                     <span class="pill pill-error">{f_error}E</span>
+                    <span class="pill pill-no_tests_collected">{f_no_tests_collected}NT</span>
                     <span class="op-score-val" style="color:{f_color}">{f_score}</span>
                     <span class="op-toggle-chev" id="filechev-{fi}">▶</span>
                   </div>
@@ -310,7 +317,7 @@ class Reporter:
       --bg:#0f1117;--bg2:#161820;--bg3:#1c1f2a;--panel:#1a1d27;
       --border:#2a2d3e;--border2:#363a52;--accent:#7c6af7;
       --text:#e8eaf0;--text2:#9da3b8;--text3:#5c6285;
-      --killed:#22d3a5;--survived:#f43f5e;--timeout:#f59e0b;--error:#818cf8;
+      --killed:#22d3a5;--survived:#f43f5e;--timeout:#f59e0b;--error:#818cf8; --no_tests_collected:#6b7280;
       --mono:'JetBrains Mono',monospace;--sans:'Syne',sans-serif;--r:8px;--r2:12px;
     }}
     *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
@@ -326,12 +333,12 @@ class Reporter:
     .hero-score-wrap{{display:flex;align-items:baseline;gap:12px;margin-bottom:4px}}
     .hero-score{{font-family:var(--mono);font-size:72px;font-weight:700;line-height:1;color:{score_color};letter-spacing:-.04em}}
     .hero-strength{{font-size:13px;font-weight:700;letter-spacing:.12em;color:{score_color};opacity:.7;text-transform:uppercase;align-self:center;padding:3px 10px;border:1px solid {score_color};border-radius:4px}}
-    .stat-grid{{display:grid;grid-template-columns:repeat(5,1fr);border:1px solid var(--border);border-radius:var(--r2);overflow:hidden;background:var(--panel)}}
+    .stat-grid{{display:grid;grid-template-columns:repeat(6,1fr);border:1px solid var(--border);border-radius:var(--r2);overflow:hidden;background:var(--panel)}}
     .stat-cell{{padding:18px 20px;border-right:1px solid var(--border)}}
     .stat-cell:last-child{{border-right:none}}
     .stat-val{{font-family:var(--mono);font-size:28px;font-weight:700;line-height:1;margin-bottom:4px}}
     .stat-label{{font-size:10px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text3)}}
-    .sv-total{{color:var(--text)}}.sv-killed{{color:var(--killed)}}.sv-survived{{color:var(--survived)}}.sv-timeout{{color:var(--timeout)}}.sv-error{{color:var(--error)}}
+    .sv-total{{color:var(--text)}}.sv-killed{{color:var(--killed)}}.sv-survived{{color:var(--survived)}}.sv-timeout{{color:var(--timeout)}}.sv-error{{color:var(--error)}}.sv-no_tests_collected{{color:var(--no_tests_collected)}}
     .master-bar-wrap{{padding:16px 36px;background:var(--bg2);border-bottom:1px solid var(--border)}}
     .master-bar-label{{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--text3);margin-bottom:6px}}
     .master-bar{{height:6px;background:var(--bg3);border-radius:99px;overflow:hidden;display:flex}}
@@ -361,6 +368,7 @@ class Reporter:
     .pill-survived{{background:rgba(244,63,94,.12);color:var(--survived)}}
     .pill-timeout{{background:rgba(245,158,11,.12);color:var(--timeout)}}
     .pill-error{{background:rgba(129,140,248,.12);color:var(--error)}}
+    .pill-no_tests_collected{{background:rgba(107,114,128,.12);color:var(--no_tests_collected)}}
     .op-score-val{{font-family:var(--mono);font-size:14px;font-weight:700;min-width:38px;text-align:right}}
     .op-toggle-chev{{font-size:10px;color:var(--text3);transition:transform .2s;margin-left:4px}}
     .op-toggle-chev.open{{transform:rotate(90deg)}}
@@ -374,6 +382,7 @@ class Reporter:
     .mutant-card.status-killed{{border-left:3px solid var(--killed)}}
     .mutant-card.status-timeout{{border-left:3px solid var(--timeout)}}
     .mutant-card.status-error{{border-left:3px solid var(--error)}}
+    .mutant-card.status-no_tests_collected{{border-left:3px solid var(--no_tests_collected)}}
     .mutant-header{{width:100%;background:none;border:none;cursor:pointer;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;text-align:left}}
     .mutant-header:hover{{background:rgba(255,255,255,.03)}}
     .mh-left{{display:flex;align-items:center;gap:10px;flex:1;min-width:0}}
@@ -384,6 +393,7 @@ class Reporter:
     .dot-survived{{background:var(--survived);box-shadow:0 0 6px var(--survived)}}
     .dot-timeout{{background:var(--timeout);box-shadow:0 0 6px var(--timeout)}}
     .dot-error{{background:var(--error);box-shadow:0 0 6px var(--error)}}
+    .dot-no_tests_collected{{background:var(--no_tests_collected);box-shadow:0 0 6px var(--no_tests_collected)}}
     .dot-unknown{{background:var(--text3)}}
     .mutant-line-preview{{font-family:var(--mono);font-size:11px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}}
     .exec-time{{font-family:var(--mono);font-size:10px;color:var(--text3)}}
@@ -394,6 +404,7 @@ class Reporter:
     .badge-survived{{background:rgba(244,63,94,.15);color:var(--survived)}}
     .badge-timeout{{background:rgba(245,158,11,.15);color:var(--timeout)}}
     .badge-error{{background:rgba(129,140,248,.15);color:var(--error)}}
+    .badge-no_tests_collected{{background:rgba(107,114,128,.12);color:var(--no_tests_collected)}}
     .badge-unknown{{background:rgba(156,163,175,.1);color:var(--text3)}}
     .mutant-body{{display:none;border-top:1px solid var(--border)}}
     .mutant-body-inner{{padding:14px}}
@@ -441,6 +452,7 @@ class Reporter:
       <div class="stat-cell"><div class="stat-val sv-survived">{rc.get('survived',0)}</div><div class="stat-label">Survived</div></div>
       <div class="stat-cell"><div class="stat-val sv-timeout">{rc.get('timeout',0)}</div><div class="stat-label">Timeout</div></div>
       <div class="stat-cell"><div class="stat-val sv-error">{rc.get('error',0)}</div><div class="stat-label">Error</div></div>
+      <div class="stat-cell"><div class="stat-val sv-no_tests_collected">{rc.get('no_tests_collected',0)}</div><div class="stat-label">No Tests</div></div>
     </div>
   </div>
   <div class="master-bar-wrap">
@@ -450,6 +462,7 @@ class Reporter:
       <div class="bar-seg" style="width:{survived_pct:.1f}%;background:var(--survived)"></div>
       <div class="bar-seg" style="width:{timeout_pct:.1f}%;background:var(--timeout)"></div>
       <div class="bar-seg" style="width:{error_pct:.1f}%;background:var(--error)"></div>
+      <div class="bar-seg" style="width:{no_tests_collected_pct:.1f}%;background:var(--no_tests_collected)"></div>
     </div>
   </div>
   <div class="content">
